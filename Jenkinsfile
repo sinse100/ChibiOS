@@ -1,4 +1,4 @@
-// Jenkinsfile
+// Jenkinsfile (v02 최적화 반영본)
 pipeline {
   agent any
 
@@ -18,7 +18,17 @@ pipeline {
     PY = "python3"
 
     // ⚠️ 실제 ChibiOS RT 빌드에 맞게 조정 필요 (compile_commands.json 생성 목적)
+    // (incremental은 필요할 때만 켜는 게 좋음)
     BUILD_CMD = "make -C testrt"
+
+    // ==========================================================
+    // [baseline에서 build-cmd 기본 비활성]
+    // - baseline은 처음 1회 전체 TU를 다 도는 구간이라 시간이 길어짐
+    // - bear + make가 더 오래 걸릴 수 있어서 기본은 ""(비활성)
+    // - 필요하면 아래 값을 BUILD_CMD와 같게 바꿔서 켜면 됨
+    //   예: BUILD_CMD_BASELINE = "make -C testrt"
+    // ==========================================================
+    BUILD_CMD_BASELINE = ""
   }
 
   triggers {
@@ -51,7 +61,7 @@ pipeline {
             echo "예시(서버에서 실행):"
             echo "  sudo visudo -f /etc/sudoers.d/jenkins-apt"
             echo "  Defaults:jenkins !requiretty"
-            echo "  jenkins ALL=(root) NOPASSWD: /usr/bin/apt-get, /usr/bin/apt, /usr/bin/dpkg"
+            echo "  jenkins ALL=(root) NOPASSWD: /usr/bin/apt-get, /usr/bin/apt, /usr/bin/dpkg, /usr/bin/true"
             exit 1
           fi
         '''
@@ -103,6 +113,20 @@ pipeline {
         sh '''
           set -eux
           export DEBIAN_FRONTEND=noninteractive
+
+          # ==========================================================
+          # [시간 최적화]
+          # - baseline에서 10분+ 걸리는 주범이 apt-get update/install인 경우가 많음
+          # - 이미 도구가 설치돼 있으면 apt 단계를 스킵해서 시간을 크게 줄임
+          # ==========================================================
+          if command -v clang >/dev/null \
+             && command -v bear  >/dev/null \
+             && command -v jq    >/dev/null \
+             && command -v python3 >/dev/null; then
+            echo "[SKIP] 의존성 이미 설치됨 (clang/bear/jq/python3)"
+            exit 0
+          fi
+
           # ==========================================================
           # [B 방식 반영]
           # - sudo -n : 비밀번호 입력 요구 시 즉시 실패 (대화형 입력 금지)
@@ -135,7 +159,8 @@ def run(cmd: List[str], check: bool = True) -> str:
 
 def run_shell(cmd: str) -> str:
     p = subprocess.run(["bash","-lc",cmd], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return p.stdout
+    # bear/make 실패 시에도 stderr를 보는 게 유용하므로 출력 합쳐서 반환
+    return (p.stdout or "") + (p.stderr or "")
 
 def sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
@@ -151,7 +176,12 @@ def list_changed_files(base: str, head: str) -> List[str]:
     return [x for x in out.splitlines() if x]
 
 def build_compile_db(build_cmd: str) -> bool:
-    run_shell(f"bear -- {build_cmd}")
+    # ==========================================================
+    # [compile_commands.json 생성]
+    # - build_cmd가 비어있으면 아예 수행하지 않음(시간 절약)
+    # - 수행하더라도 compile_commands.json이 없으면 fallback include로 진행
+    # ==========================================================
+    _ = run_shell(f"bear -- {build_cmd}")
     return Path("compile_commands.json").exists()
 
 def read_compile_db() -> Dict[str, List[str]]:
@@ -166,12 +196,14 @@ def read_compile_db() -> Dict[str, List[str]]:
             continue
         absf = str(Path(fp).resolve())
         args = e.get("arguments") or e.get("command","").split()
+        # 컴파일러 제거(첫 토큰이 컴파일러인 경우가 많음)
         if args and (args[0].endswith("clang") or args[0].endswith("gcc") or args[0].endswith("cc")):
             args = args[1:]
         mapping[absf] = args
     return mapping
 
 def filter_args(args: List[str]) -> List[str]:
+    # 빌드 플래그 중 clang AST에 불필요/위험한 항목 제거
     skip = {"-c","-MMD","-MP"}
     out: List[str] = []
     i=0
@@ -231,6 +263,7 @@ def select_incremental_tus(changed: List[str], root: Path) -> List[Path]:
     for p in changed:
         if p.startswith("os/rt/src/") and p.endswith(".c"):
             tus.add(root/p)
+    # 헤더 변경은 보수적으로 전체 TU 재생성
     if header_changed:
         tus |= set(list_all_rt_tus(root))
     return sorted(tus)
@@ -256,10 +289,15 @@ def main():
     if args.build_cmd and build_compile_db(args.build_cmd):
         compile_db = read_compile_db()
 
+    # ==================================================
+    # [MODE 분기]
+    # ==================================================
     if args.mode == "baseline":
+        # 최초 실행: os/rt/src 전체 AST 생성
         tus = list_all_rt_tus(root)
         changed_files = ["(baseline 초기 생성)"]
     else:
+        # 이후 실행: 변경 파일 기반 TU 선택
         changed_files = list_changed_files(args.base, args.head)
         tus = select_incremental_tus(changed_files, root)
 
@@ -307,6 +345,13 @@ PY
 
     stage('AST 생성 및 diff (롤백 포함)') {
       when { expression { return env.DO_AST == "1" } }
+
+      // ==========================================================
+      // [무한 대기 방지]
+      // - baseline/build/bear/clang 중 어디서 멈추든 일정 시간 지나면 종료
+      // ==========================================================
+      options { timeout(time: 25, unit: 'MINUTES') }
+
       steps {
         sh '''
           set -euo pipefail
@@ -322,29 +367,20 @@ PY
           # [롤백/원자적 갱신 전략]
           #
           # 1) 최종 저장소(AST_STORE)에는 "임시 디렉터리"로 먼저 저장한다.
-          # 2) AST 생성 + rsync가 모두 성공한 뒤에만
-          #    최종 경로로 mv(원자적 교체) 한다.
+          # 2) AST 생성 + rsync가 모두 성공한 뒤에만 최종 경로로 mv(원자적 교체) 한다.
           # 3) 실패하면:
           #    - 임시 디렉터리 삭제
           #    - baseline을 건드리던 중이면 이전 baseline 복구
-          #
-          # 즉, "실패한 빌드의 결과물"이 baseline이나 commit 폴더에
-          # 반쯤 저장되어 남지 않게 한다(트랜잭션/롤백).
           # ==========================================================
 
-          # 임시 경로(빌드마다 유니크)
           TS=$(date +%Y%m%d_%H%M%S)
           TMP_BASE="${AST_ROOT}/.tmp_baseline_${COMMIT}_${TS}"
           TMP_COMMIT="${AST_ROOT}/.tmp_commit_${COMMIT}_${TS}"
 
-          # 실패 시 처리(임시 제거 + baseline 복구)
           rollback() {
             echo "[ROLLBACK] 빌드 실패 감지 → 임시 결과물 정리 및(필요 시) baseline 복구"
-
-            # 임시 디렉터리 정리
             rm -rf "${TMP_BASE}" "${TMP_COMMIT}" || true
 
-            # baseline 백업이 있고, baseline 교체 도중 실패했다면 복구
             if [ -n "${BASELINE_BACKUP:-}" ] && [ -d "${BASELINE_BACKUP}" ]; then
               echo "[ROLLBACK] baseline 복구 수행: ${BASELINE_BACKUP} → ${BASELINE_DIR}"
               rm -rf "${BASELINE_DIR}" || true
@@ -357,25 +393,31 @@ PY
             # ======================================================
             # [최초 실행 / baseline 생성]
             # - os/rt/src 전체 AST 생성
-            # - 최종 baseline 경로는 "성공했을 때만" 교체
+            # - baseline은 성공했을 때만 원자적으로 교체
             # ======================================================
 
             OUT="ast_out/baseline_${COMMIT}"
             mkdir -p "$OUT"
 
             echo "[BASELINE] 전체 TU AST 생성 시작"
+
+            # ======================================================
+            # [baseline build-cmd 선택]
+            # - 기본은 BUILD_CMD_BASELINE="" 이므로 bear/make를 수행하지 않음(시간 절약)
+            # - 필요하면 Jenkinsfile 상단에서 BUILD_CMD_BASELINE 값을 조정해서 켜면 됨
+            # ======================================================
+            BASELINE_BUILD_CMD="${BUILD_CMD_BASELINE}"
+
             ${PY} tools/ast_ci/ast_build_and_diff.py \
               --outdir "$OUT" \
               --base "HEAD" \
               --head "HEAD" \
               --mode "baseline" \
-              --build-cmd "${BUILD_CMD}"
+              --build-cmd "${BASELINE_BUILD_CMD}"
 
-            # baseline 임시 디렉터리에 먼저 복사
             mkdir -p "${TMP_BASE}"
             rsync -a --delete "$OUT/" "${TMP_BASE}/"
 
-            # (선택) 기존 baseline이 있으면 백업해둔 후 교체
             if [ -d "${BASELINE_DIR}" ] && [ "$(ls -A "${BASELINE_DIR}" 2>/dev/null || true)" != "" ]; then
               BASELINE_BACKUP="${AST_ROOT}/.backup_baseline_${TS}"
               echo "[BASELINE] 기존 baseline 백업: ${BASELINE_DIR} → ${BASELINE_BACKUP}"
@@ -386,7 +428,6 @@ PY
             rm -rf "${BASELINE_DIR}" || true
             mv "${TMP_BASE}" "${BASELINE_DIR}"
 
-            # 성공했으니 백업은 정리(원하면 남겨도 됨)
             if [ -n "${BASELINE_BACKUP:-}" ] && [ -d "${BASELINE_BACKUP}" ]; then
               echo "[BASELINE] 교체 성공 → 이전 baseline 백업 정리: ${BASELINE_BACKUP}"
               rm -rf "${BASELINE_BACKUP}"
@@ -399,10 +440,9 @@ PY
             # ======================================================
             # [이후 실행 / incremental + diff]
             # - baseline 커밋을 기준으로 diff 수행
-            # - commit 결과 저장도 임시에 저장 후 성공 시에만 이동
+            # - commit 결과 저장도 임시 저장 후 성공 시에만 이동
             # ======================================================
 
-            # baseline 기준 커밋 읽기(없으면 origin/master로 fallback)
             BASE_COMMIT=""
             if [ -f "${BASELINE_DIR}/summary.json" ]; then
               BASE_COMMIT=$(jq -r '.head_commit // .headCommit // empty' "${BASELINE_DIR}/summary.json" || true)
@@ -426,13 +466,11 @@ PY
               --mode "incremental" \
               --build-cmd "${BUILD_CMD}"
 
-            # 커밋 결과도 임시 디렉터리에 먼저 저장
             mkdir -p "${TMP_COMMIT}"
             rsync -a --delete "$OUT/" "${TMP_COMMIT}/"
 
             FINAL_COMMIT_DIR="${AST_ROOT}/${COMMIT}"
 
-            # 최종 커밋 디렉터리 원자적 교체(기존 있으면 백업 후 교체)
             if [ -d "${FINAL_COMMIT_DIR}" ] && [ "$(ls -A "${FINAL_COMMIT_DIR}" 2>/dev/null || true)" != "" ]; then
               COMMIT_BACKUP="${AST_ROOT}/.backup_commit_${COMMIT}_${TS}"
               echo "[INCREMENTAL] 기존 커밋 결과 백업: ${FINAL_COMMIT_DIR} → ${COMMIT_BACKUP}"
@@ -443,7 +481,6 @@ PY
             rm -rf "${FINAL_COMMIT_DIR}" || true
             mv "${TMP_COMMIT}" "${FINAL_COMMIT_DIR}"
 
-            # 성공했으니 백업 정리(원하면 남겨도 됨)
             if [ -n "${COMMIT_BACKUP:-}" ] && [ -d "${COMMIT_BACKUP}" ]; then
               echo "[INCREMENTAL] 교체 성공 → 이전 커밋 결과 백업 정리: ${COMMIT_BACKUP}"
               rm -rf "${COMMIT_BACKUP}"
@@ -453,7 +490,6 @@ PY
             ls -la "${FINAL_COMMIT_DIR}" || true
           fi
 
-          # 성공 시 trap 해제(롤백 불필요)
           trap - ERR
         '''
       }
