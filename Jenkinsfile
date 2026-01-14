@@ -3,14 +3,16 @@ pipeline {
   agent any
 
   options {
-    timestamps()
-    ansiColor('xterm')
+    // [중요] 아래 두 옵션은 Jenkins에 해당 옵션/플러그인이 없으면 파이프라인 파싱 단계에서 실패함
+    // timestamps()
+    // ansiColor('xterm')
+
+    // 빌드 기록만 30개 유지
     buildDiscarder(logRotator(numToKeepStr: '30'))
   }
 
   environment {
-    // AST 결과를 서버에 영구 저장할 경로
-    // (Jenkins 실행 계정이 쓰기 권한을 가져야 함)
+    // AST 결과를 서버에 영구 저장할 경로 (Jenkins 실행 계정이 쓰기 권한을 가져야 함)
     AST_STORE = "/var/lib/jenkins/ast/chibios-os-rt"
 
     // 사용 도구
@@ -18,10 +20,10 @@ pipeline {
     PY = "python3"
 
     // ⚠️ 반드시 실제 ChibiOS RT 빌드에 맞는 명령으로 조정 필요
-    // 이 빌드를 통해 compile_commands.json을 생성함
+    // 이 빌드를 통해 compile_commands.json을 생성하려는 목적
     BUILD_CMD = "make -C testrt"
 
-    // 병합 AST 생성 시, 함수 호출을 몇 단계까지 따라갈지
+    // (이 Jenkinsfile 버전에서는 병합 AST를 사용하지 않지만, 환경변수는 유지)
     MERGE_DEPTH = "2"
   }
 
@@ -138,7 +140,7 @@ import subprocess
 import sys
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Set, Optional
+from typing import Any, Dict, List, Set
 
 # -------------------------------
 # 공통 유틸리티 함수
@@ -153,8 +155,9 @@ def run(cmd: List[str], check: bool = True) -> str:
     return p.stdout
 
 def run_shell(cmd: str) -> str:
-    """쉘 명령 실행"""
-    return run(["bash", "-lc", cmd], check=False)
+    """쉘 명령 실행(실패해도 종료하지 않음)"""
+    p = subprocess.run(["bash", "-lc", cmd], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return p.stdout
 
 def sha1_text(s: str) -> str:
     """문자열 해시"""
@@ -163,6 +166,10 @@ def sha1_text(s: str) -> str:
 def git_rev(ref: str) -> str:
     """Git 커밋 해시 조회"""
     return run(["git", "rev-parse", ref]).strip()
+
+def ensure_parent_dir(p: Path) -> None:
+    """파일을 쓰기 전에 부모 디렉터리를 반드시 생성"""
+    p.parent.mkdir(parents=True, exist_ok=True)
 
 # -------------------------------
 # Git 변경 파일 탐지
@@ -178,7 +185,7 @@ def list_changed_files(base: str, head: str) -> List[str]:
 # -------------------------------
 
 def build_compile_db(build_cmd: str) -> bool:
-    """bear를 사용해 compile_commands.json 생성"""
+    """bear를 사용해 compile_commands.json 생성(실패해도 진행)"""
     run_shell(f"bear -- {build_cmd}")
     return Path("compile_commands.json").exists()
 
@@ -188,18 +195,30 @@ def read_compile_db() -> Dict[str, List[str]]:
     if not db.exists():
         return {}
 
-    data = json.loads(db.read_text())
-    mapping = {}
+    data = json.loads(db.read_text(encoding="utf-8", errors="ignore"))
+    mapping: Dict[str, List[str]] = {}
     for e in data:
-        f = str(Path(e["file"]).resolve())
-        args = e.get("arguments") or e.get("command", "").split()
-        mapping[f] = args[1:]  # 컴파일러 제거
+        file_path = e.get("file")
+        if not file_path:
+            continue
+        abs_file = str(Path(file_path).resolve())
+
+        args = e.get("arguments")
+        if not args:
+            cmd = e.get("command", "")
+            args = cmd.split()
+
+        # args[0]이 컴파일러일 가능성이 높지만, 환경에 따라 아닐 수도 있으니 안전하게 처리
+        if args and (args[0].endswith("clang") or args[0].endswith("gcc") or args[0].endswith("cc")):
+            args = args[1:]
+
+        mapping[abs_file] = args
     return mapping
 
 def filter_args(args: List[str]) -> List[str]:
     """AST 생성에 불필요한 옵션 제거"""
     skip = {"-c", "-MMD", "-MP"}
-    out = []
+    out: List[str] = []
     i = 0
     while i < len(args):
         if args[i] in skip:
@@ -223,7 +242,7 @@ def clang_ast(clang: str, src: str, flags: List[str]) -> Dict[str, Any]:
     return json.loads(run(cmd))
 
 def normalise(node: Any) -> str:
-    """AST 노드를 문자열로 정규화"""
+    """AST 노드를 문자열로 정규화(단순 버전)"""
     if not isinstance(node, dict):
         return ""
     s = f"{node.get('kind','')}|{node.get('name','')}"
@@ -233,8 +252,8 @@ def normalise(node: Any) -> str:
 
 def index_functions(ast: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """함수 선언 노드 인덱싱"""
-    out = {}
-    def walk(n):
+    out: Dict[str, Dict[str, Any]] = {}
+    def walk(n: Any):
         if isinstance(n, dict):
             if n.get("kind") == "FunctionDecl" and n.get("name"):
                 out[n["name"]] = n
@@ -243,7 +262,7 @@ def index_functions(ast: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     walk(ast)
     return out
 
-def diff_functions(a, b):
+def diff_functions(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, List[str]]:
     """함수 단위 AST diff"""
     fa = index_functions(a)
     fb = index_functions(b)
@@ -251,7 +270,7 @@ def diff_functions(a, b):
         "only_before": sorted(set(fa) - set(fb)),
         "only_after": sorted(set(fb) - set(fa)),
         "changed": sorted(
-            f for f in fa.keys() & fb.keys()
+            f for f in (fa.keys() & fb.keys())
             if sha1_text(normalise(fa[f])) != sha1_text(normalise(fb[f]))
         )
     }
@@ -266,15 +285,16 @@ def list_all_rt_tus(root: Path) -> List[Path]:
 
 def select_incremental_tus(changed: List[str], root: Path) -> List[Path]:
     """변경 기반 TU 선택"""
-    tus = set()
+    tus: Set[Path] = set()
     header_changed = any(p.startswith("os/rt/include/") for p in changed)
 
+    # src/*.c 변경 → 해당 TU만
     for p in changed:
         if p.startswith("os/rt/src/") and p.endswith(".c"):
             tus.add(root / p)
 
+    # include/*.h 변경 → 보수적으로 전체 TU 재생성
     if header_changed:
-        # 헤더 변경 시 보수적으로 전체 TU 재생성
         tus |= set(list_all_rt_tus(root))
 
     return sorted(tus)
@@ -301,7 +321,7 @@ def main():
     base_commit = git_rev(args.base)
     head_commit = git_rev(args.head)
 
-    compile_db = {}
+    compile_db: Dict[str, List[str]] = {}
     if args.build_cmd and build_compile_db(args.build_cmd):
         compile_db = read_compile_db()
 
@@ -309,23 +329,28 @@ def main():
     # [MODE 분기]
     # ==================================================
     if args.mode == "baseline":
-        # 최초 실행: os/rt/src 전체 AST 생성
         tus = list_all_rt_tus(root)
-        changed = ["(baseline 초기 생성)"]
+        changed_files = ["(baseline 초기 생성)"]
     else:
-        # 이후 실행: 변경 파일 기반 TU 선택
-        changed = list_changed_files(args.base, args.head)
-        tus = select_incremental_tus(changed, root)
+        changed_files = list_changed_files(args.base, args.head)
+        tus = select_incremental_tus(changed_files, root)
 
     results = []
 
     for tu in tus:
         rel = tu.relative_to(root)
+
         before = out / f"{rel}.before.c"
         after  = out / f"{rel}.after.c"
+        diffp  = out / f"{rel}.diff.json"
 
-        before.write_text(run(["git", "show", f"{base_commit}:{rel}"], check=False))
-        after.write_text(run(["git", "show", f"{head_commit}:{rel}"], check=False))
+        # ★중요: 하위 경로 파일이므로 부모 디렉터리 생성
+        ensure_parent_dir(before)
+        ensure_parent_dir(after)
+        ensure_parent_dir(diffp)
+
+        before.write_text(run(["git", "show", f"{base_commit}:{rel}"], check=False), encoding="utf-8", errors="ignore")
+        after.write_text(run(["git", "show", f"{head_commit}:{rel}"], check=False), encoding="utf-8", errors="ignore")
 
         flags = compile_db.get(str(tu.resolve()), args.fallback_includes)
         flags = filter_args(flags)
@@ -334,22 +359,24 @@ def main():
         ast_a = clang_ast(args.clang, str(after), flags)
 
         diff = diff_functions(ast_b, ast_a)
+        diffp.write_text(json.dumps(diff, indent=2), encoding="utf-8")
 
-        (out / f"{rel}.diff.json").write_text(json.dumps(diff, indent=2))
         results.append({"tu": str(rel), **diff})
 
     summary = {
         "mode": args.mode,
         "base_commit": base_commit,
         "head_commit": head_commit,
-        "changed_files": changed,
+        "changed_files": changed_files,
         "results": results
     }
-    (out / "summary.json").write_text(json.dumps(summary, indent=2))
+    (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 if __name__ == "__main__":
     main()
 PY
+
+          chmod +x tools/ast_ci/ast_build_and_diff.py
         '''
       }
     }
@@ -361,6 +388,7 @@ PY
           set -eux
           COMMIT=$(git rev-parse --short HEAD)
           BASELINE_DIR="${AST_STORE}/baseline"
+          mkdir -p "${BASELINE_DIR}"
 
           if [ "${AST_MODE}" = "baseline" ]; then
             # ======================================================
@@ -369,6 +397,8 @@ PY
             # - baseline으로 저장
             # ======================================================
             OUT="ast_out/baseline_${COMMIT}"
+            mkdir -p "$OUT"
+
             python3 tools/ast_ci/ast_build_and_diff.py \
               --outdir "$OUT" \
               --base "HEAD" \
@@ -385,6 +415,8 @@ PY
             # - baseline 대비 함수 단위 diff
             # ======================================================
             OUT="ast_out/${COMMIT}"
+            mkdir -p "$OUT"
+
             BASE_COMMIT=$(jq -r '.head_commit' "${BASELINE_DIR}/summary.json")
 
             python3 tools/ast_ci/ast_build_and_diff.py \
