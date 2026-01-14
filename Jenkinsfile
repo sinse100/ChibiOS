@@ -3,10 +3,9 @@ pipeline {
   agent any
 
   options {
-    // (플러그인 의존 옵션은 환경에 따라 파싱 실패할 수 있어 제거/비활성 권장)
+    // 플러그인 의존 옵션은 환경에 따라 파싱 실패할 수 있어 기본 비활성 권장
     // timestamps()
     // ansiColor('xterm')
-
     buildDiscarder(logRotator(numToKeepStr: '30'))
   }
 
@@ -18,16 +17,11 @@ pipeline {
     CLANG = "clang"
     PY = "python3"
 
-    // ⚠️ 실제 ChibiOS RT 빌드에 맞는 명령으로 조정 필요
-    // 목적: bear로 compile_commands.json 생성 시도
+    // ⚠️ 실제 ChibiOS RT 빌드에 맞게 조정 필요 (compile_commands.json 생성 목적)
     BUILD_CMD = "make -C testrt"
-
-    // (사용 안 해도 유지)
-    MERGE_DEPTH = "2"
   }
 
   triggers {
-    // GitHub Webhook / Multibranch 사용 권장
     pollSCM('H/5 * * * *')
   }
 
@@ -44,24 +38,20 @@ pipeline {
       steps {
         sh '''
           set -eux
-
           # ==========================================================
-          # [중요]
+          # [B 방식 전제]
           # Jenkinsfile에서 apt 설치를 위해 sudo를 사용하므로,
           # jenkins 유저가 비밀번호 없이 sudo 실행 가능해야 함(NOPASSWD).
-          #
-          # 아래 명령은 "비밀번호 입력 요구"가 발생하면 즉시 실패(-n).
+          # -n 옵션으로 "비밀번호 요구" 시 즉시 실패하게 함.
           # ==========================================================
           if sudo -n true 2>/dev/null; then
             echo "[OK] jenkins 계정이 비밀번호 없이 sudo 사용 가능"
           else
             echo "[ERROR] jenkins 계정이 NOPASSWD sudo 설정이 되어있지 않습니다."
-            echo "다음 중 하나로 해결하세요:"
-            echo "  (방법 B) sudoers에 jenkins의 apt 권한을 NOPASSWD로 추가"
-            echo "    sudo visudo -f /etc/sudoers.d/jenkins-apt"
-            echo "    내용 예시:"
-            echo "      Defaults:jenkins !requiretty"
-            echo "      jenkins ALL=(root) NOPASSWD: /usr/bin/apt-get, /usr/bin/apt, /usr/bin/dpkg"
+            echo "예시(서버에서 실행):"
+            echo "  sudo visudo -f /etc/sudoers.d/jenkins-apt"
+            echo "  Defaults:jenkins !requiretty"
+            echo "  jenkins ALL=(root) NOPASSWD: /usr/bin/apt-get, /usr/bin/apt, /usr/bin/dpkg"
             exit 1
           fi
         '''
@@ -74,10 +64,17 @@ pipeline {
           // baseline 디렉터리 보장
           sh "mkdir -p '${env.AST_STORE}/baseline'"
 
-          // baseline 존재 여부
+          // ==========================================================
+          // [BASELINE 존재 여부 판단]
+          // - 최초 실행이거나 ${AST_STORE}/baseline/summary.json 이 없으면
+          //   → baseline AST를 처음부터 생성해야 함
+          // ==========================================================
           def baselineExists = fileExists("${env.AST_STORE}/baseline/summary.json")
 
-          // origin/master..HEAD 범위에서 os/rt/** 변경 여부 확인
+          // ==========================================================
+          // [변경 사항 감지]
+          // - origin/master..HEAD 범위에서 os/rt/** 변경이 있는지 확인
+          // ==========================================================
           sh "git fetch origin master:refs/remotes/origin/master || true"
           def changed = sh(
             script: "git diff --name-only origin/master..HEAD | grep '^os/rt/' || true",
@@ -85,16 +82,13 @@ pipeline {
           ).trim()
 
           if (!baselineExists) {
-            // 최초 실행: baseline 생성
             echo "Baseline AST가 존재하지 않음 → 최초 baseline 생성"
             env.DO_AST = "1"
             env.AST_MODE = "baseline"
           } else if (changed == "") {
-            // 변경 없음: 스킵
             echo "os/rt 변경 없음 → AST 단계 스킵"
             env.DO_AST = "0"
           } else {
-            // 변경 있음: incremental
             echo "os/rt 변경 감지 → incremental AST 수행"
             env.DO_AST = "1"
             env.AST_MODE = "incremental"
@@ -109,11 +103,9 @@ pipeline {
         sh '''
           set -eux
           export DEBIAN_FRONTEND=noninteractive
-
           # ==========================================================
           # [B 방식 반영]
-          # - sudo -n : 비밀번호 입력을 요구하면 즉시 실패 (대화형 입력 금지)
-          # - NOPASSWD sudo 설정이 되어있어야 통과
+          # - sudo -n : 비밀번호 입력 요구 시 즉시 실패 (대화형 입력 금지)
           # ==========================================================
           sudo -n apt-get update
           sudo -n apt-get install -y clang bear jq python3
@@ -130,11 +122,7 @@ pipeline {
 
           cat > tools/ast_ci/ast_build_and_diff.py << 'PY'
 #!/usr/bin/env python3
-import argparse
-import json
-import subprocess
-import sys
-import hashlib
+import argparse, json, subprocess, sys, hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
@@ -146,20 +134,20 @@ def run(cmd: List[str], check: bool = True) -> str:
     return p.stdout
 
 def run_shell(cmd: str) -> str:
-    p = subprocess.run(["bash", "-lc", cmd], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.run(["bash","-lc",cmd], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return p.stdout
 
 def sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
 def git_rev(ref: str) -> str:
-    return run(["git", "rev-parse", ref]).strip()
+    return run(["git","rev-parse",ref]).strip()
 
-def ensure_parent_dir(p: Path) -> None:
+def ensure_parent(p: Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
 
 def list_changed_files(base: str, head: str) -> List[str]:
-    out = run(["git", "diff", "--name-only", f"{base}..{head}"])
+    out = run(["git","diff","--name-only",f"{base}..{head}"])
     return [x for x in out.splitlines() if x]
 
 def build_compile_db(build_cmd: str) -> bool:
@@ -170,45 +158,37 @@ def read_compile_db() -> Dict[str, List[str]]:
     db = Path("compile_commands.json")
     if not db.exists():
         return {}
-
     data = json.loads(db.read_text(encoding="utf-8", errors="ignore"))
     mapping: Dict[str, List[str]] = {}
-
     for e in data:
-        file_path = e.get("file")
-        if not file_path:
+        fp = e.get("file")
+        if not fp:
             continue
-        abs_file = str(Path(file_path).resolve())
-
-        args = e.get("arguments")
-        if not args:
-            cmd = e.get("command", "")
-            args = cmd.split()
-
+        absf = str(Path(fp).resolve())
+        args = e.get("arguments") or e.get("command","").split()
         if args and (args[0].endswith("clang") or args[0].endswith("gcc") or args[0].endswith("cc")):
             args = args[1:]
-
-        mapping[abs_file] = args
+        mapping[absf] = args
     return mapping
 
 def filter_args(args: List[str]) -> List[str]:
-    skip = {"-c", "-MMD", "-MP"}
+    skip = {"-c","-MMD","-MP"}
     out: List[str] = []
-    i = 0
+    i=0
     while i < len(args):
-        if args[i] in skip:
-            i += 1
-        elif args[i] in ("-o", "-MF", "-MT", "-MQ"):
-            i += 2
-        elif args[i].endswith(".c"):
-            i += 1
+        a=args[i]
+        if a in skip:
+            i+=1
+        elif a in ("-o","-MF","-MT","-MQ"):
+            i+=2
+        elif a.endswith(".c"):
+            i+=1
         else:
-            out.append(args[i])
-            i += 1
+            out.append(a); i+=1
     return out
 
 def clang_ast(clang: str, src: str, flags: List[str]) -> Dict[str, Any]:
-    cmd = [clang, "-Xclang", "-ast-dump=json", "-fsyntax-only", src] + flags
+    cmd = [clang,"-Xclang","-ast-dump=json","-fsyntax-only",src] + flags
     return json.loads(run(cmd))
 
 def normalise(node: Any) -> str:
@@ -223,7 +203,7 @@ def index_functions(ast: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     def walk(n: Any):
         if isinstance(n, dict):
-            if n.get("kind") == "FunctionDecl" and n.get("name"):
+            if n.get("kind")=="FunctionDecl" and n.get("name"):
                 out[n["name"]] = n
             for c in n.get("inner", []) or []:
                 walk(c)
@@ -235,7 +215,7 @@ def diff_functions(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, List[str]]
     fb = index_functions(b)
     return {
         "only_before": sorted(set(fa) - set(fb)),
-        "only_after": sorted(set(fb) - set(fa)),
+        "only_after":  sorted(set(fb) - set(fa)),
         "changed": sorted(
             f for f in (fa.keys() & fb.keys())
             if sha1_text(normalise(fa[f])) != sha1_text(normalise(fb[f]))
@@ -243,19 +223,16 @@ def diff_functions(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, List[str]]
     }
 
 def list_all_rt_tus(root: Path) -> List[Path]:
-    return sorted((root / "os/rt/src").rglob("*.c"))
+    return sorted((root/"os/rt/src").rglob("*.c"))
 
 def select_incremental_tus(changed: List[str], root: Path) -> List[Path]:
     tus: Set[Path] = set()
-    header_changed = any(p.startswith("os/rt/include/") for p in changed)
-
+    header_changed = any(p.startswith("os/rt/include/") and p.endswith(".h") for p in changed)
     for p in changed:
         if p.startswith("os/rt/src/") and p.endswith(".c"):
-            tus.add(root / p)
-
+            tus.add(root/p)
     if header_changed:
         tus |= set(list_all_rt_tus(root))
-
     return sorted(tus)
 
 def main():
@@ -263,15 +240,14 @@ def main():
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--base", required=True)
     ap.add_argument("--head", required=True)
-    ap.add_argument("--mode", choices=["baseline", "incremental"], required=True)
+    ap.add_argument("--mode", choices=["baseline","incremental"], required=True)
     ap.add_argument("--clang", default="clang")
     ap.add_argument("--build-cmd", default="")
     ap.add_argument("--fallback-includes", nargs="*", default=["-Ios/rt/include"])
     args = ap.parse_args()
 
     root = Path(".").resolve()
-    out = Path(args.outdir)
-    out.mkdir(parents=True, exist_ok=True)
+    out = Path(args.outdir); out.mkdir(parents=True, exist_ok=True)
 
     base_commit = git_rev(args.base)
     head_commit = git_rev(args.head)
@@ -288,7 +264,6 @@ def main():
         tus = select_incremental_tus(changed_files, root)
 
     results = []
-
     for tu in tus:
         rel = tu.relative_to(root)
 
@@ -296,18 +271,16 @@ def main():
         after  = out / f"{rel}.after.c"
         diffp  = out / f"{rel}.diff.json"
 
-        ensure_parent_dir(before)
-        ensure_parent_dir(after)
-        ensure_parent_dir(diffp)
+        ensure_parent(before); ensure_parent(after); ensure_parent(diffp)
 
-        before.write_text(run(["git", "show", f"{base_commit}:{rel}"], check=False), encoding="utf-8", errors="ignore")
-        after.write_text(run(["git", "show", f"{head_commit}:{rel}"], check=False), encoding="utf-8", errors="ignore")
+        before.write_text(run(["git","show",f"{base_commit}:{rel}"], check=False), encoding="utf-8", errors="ignore")
+        after.write_text(run(["git","show",f"{head_commit}:{rel}"], check=False), encoding="utf-8", errors="ignore")
 
-        flags = compile_db.get(str(tu.resolve()), args.fallback-includes) if False else compile_db.get(str(tu.resolve()), args.fallback_includes)
+        flags = compile_db.get(str(tu.resolve()), args.fallback_includes)
         flags = filter_args(flags)
 
         ast_b = clang_ast(args.clang, str(before), flags)
-        ast_a = clang_ast(args.clang, str(after), flags)
+        ast_a = clang_ast(args.clang, str(after),  flags)
 
         diff = diff_functions(ast_b, ast_a)
         diffp.write_text(json.dumps(diff, indent=2), encoding="utf-8")
@@ -321,7 +294,7 @@ def main():
         "changed_files": changed_files,
         "results": results
     }
-    (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (out/"summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 if __name__ == "__main__":
     main()
@@ -332,47 +305,164 @@ PY
       }
     }
 
-    stage('AST 생성 및 diff') {
+    stage('AST 생성 및 diff (롤백 포함)') {
       when { expression { return env.DO_AST == "1" } }
       steps {
         sh '''
-          set -eux
+          set -euo pipefail
+
           COMMIT=$(git rev-parse --short HEAD)
-          BASELINE_DIR="${AST_STORE}/baseline"
-          mkdir -p "${BASELINE_DIR}"
+          AST_ROOT="${AST_STORE}"
+          BASELINE_DIR="${AST_ROOT}/baseline"
+
+          mkdir -p "${AST_ROOT}"
+          mkdir -p "ast_out"
+
+          # ==========================================================
+          # [롤백/원자적 갱신 전략]
+          #
+          # 1) 최종 저장소(AST_STORE)에는 "임시 디렉터리"로 먼저 저장한다.
+          # 2) AST 생성 + rsync가 모두 성공한 뒤에만
+          #    최종 경로로 mv(원자적 교체) 한다.
+          # 3) 실패하면:
+          #    - 임시 디렉터리 삭제
+          #    - baseline을 건드리던 중이면 이전 baseline 복구
+          #
+          # 즉, "실패한 빌드의 결과물"이 baseline이나 commit 폴더에
+          # 반쯤 저장되어 남지 않게 한다(트랜잭션/롤백).
+          # ==========================================================
+
+          # 임시 경로(빌드마다 유니크)
+          TS=$(date +%Y%m%d_%H%M%S)
+          TMP_BASE="${AST_ROOT}/.tmp_baseline_${COMMIT}_${TS}"
+          TMP_COMMIT="${AST_ROOT}/.tmp_commit_${COMMIT}_${TS}"
+
+          # 실패 시 처리(임시 제거 + baseline 복구)
+          rollback() {
+            echo "[ROLLBACK] 빌드 실패 감지 → 임시 결과물 정리 및(필요 시) baseline 복구"
+
+            # 임시 디렉터리 정리
+            rm -rf "${TMP_BASE}" "${TMP_COMMIT}" || true
+
+            # baseline 백업이 있고, baseline 교체 도중 실패했다면 복구
+            if [ -n "${BASELINE_BACKUP:-}" ] && [ -d "${BASELINE_BACKUP}" ]; then
+              echo "[ROLLBACK] baseline 복구 수행: ${BASELINE_BACKUP} → ${BASELINE_DIR}"
+              rm -rf "${BASELINE_DIR}" || true
+              mv "${BASELINE_BACKUP}" "${BASELINE_DIR}" || true
+            fi
+          }
+          trap rollback ERR
 
           if [ "${AST_MODE}" = "baseline" ]; then
-            # [최초 실행] os/rt/src 전체 AST 생성 → baseline 저장
+            # ======================================================
+            # [최초 실행 / baseline 생성]
+            # - os/rt/src 전체 AST 생성
+            # - 최종 baseline 경로는 "성공했을 때만" 교체
+            # ======================================================
+
             OUT="ast_out/baseline_${COMMIT}"
             mkdir -p "$OUT"
 
-            python3 tools/ast_ci/ast_build_and_diff.py \
+            echo "[BASELINE] 전체 TU AST 생성 시작"
+            ${PY} tools/ast_ci/ast_build_and_diff.py \
               --outdir "$OUT" \
               --base "HEAD" \
               --head "HEAD" \
               --mode "baseline" \
               --build-cmd "${BUILD_CMD}"
 
-            rsync -a "$OUT/" "${BASELINE_DIR}/"
+            # baseline 임시 디렉터리에 먼저 복사
+            mkdir -p "${TMP_BASE}"
+            rsync -a --delete "$OUT/" "${TMP_BASE}/"
+
+            # (선택) 기존 baseline이 있으면 백업해둔 후 교체
+            if [ -d "${BASELINE_DIR}" ] && [ "$(ls -A "${BASELINE_DIR}" 2>/dev/null || true)" != "" ]; then
+              BASELINE_BACKUP="${AST_ROOT}/.backup_baseline_${TS}"
+              echo "[BASELINE] 기존 baseline 백업: ${BASELINE_DIR} → ${BASELINE_BACKUP}"
+              mv "${BASELINE_DIR}" "${BASELINE_BACKUP}"
+            fi
+
+            echo "[BASELINE] baseline 원자적 교체: ${TMP_BASE} → ${BASELINE_DIR}"
+            rm -rf "${BASELINE_DIR}" || true
+            mv "${TMP_BASE}" "${BASELINE_DIR}"
+
+            # 성공했으니 백업은 정리(원하면 남겨도 됨)
+            if [ -n "${BASELINE_BACKUP:-}" ] && [ -d "${BASELINE_BACKUP}" ]; then
+              echo "[BASELINE] 교체 성공 → 이전 baseline 백업 정리: ${BASELINE_BACKUP}"
+              rm -rf "${BASELINE_BACKUP}"
+            fi
+
+            echo "[BASELINE] 완료: ${BASELINE_DIR}/summary.json 생성 여부 확인"
+            ls -la "${BASELINE_DIR}" || true
+
           else
-            # [이후 실행] 변경된 TU만 AST 생성 + baseline 대비 diff
+            # ======================================================
+            # [이후 실행 / incremental + diff]
+            # - baseline 커밋을 기준으로 diff 수행
+            # - commit 결과 저장도 임시에 저장 후 성공 시에만 이동
+            # ======================================================
+
+            # baseline 기준 커밋 읽기(없으면 origin/master로 fallback)
+            BASE_COMMIT=""
+            if [ -f "${BASELINE_DIR}/summary.json" ]; then
+              BASE_COMMIT=$(jq -r '.head_commit // .headCommit // empty' "${BASELINE_DIR}/summary.json" || true)
+            fi
+            if [ -z "${BASE_COMMIT}" ] || [ "${BASE_COMMIT}" = "null" ]; then
+              echo "[INCREMENTAL] baseline 기준 커밋을 못 읽음 → origin/master 사용"
+              BASE_REF="origin/master"
+            else
+              BASE_REF="${BASE_COMMIT}"
+              echo "[INCREMENTAL] baseline 기준 커밋: ${BASE_REF}"
+            fi
+
             OUT="ast_out/${COMMIT}"
             mkdir -p "$OUT"
 
-            BASE_COMMIT=$(jq -r '.head_commit' "${BASELINE_DIR}/summary.json")
-
-            python3 tools/ast_ci/ast_build_and_diff.py \
+            echo "[INCREMENTAL] 변경 TU AST 생성 + diff 시작"
+            ${PY} tools/ast_ci/ast_build_and_diff.py \
               --outdir "$OUT" \
-              --base "${BASE_COMMIT}" \
+              --base "${BASE_REF}" \
               --head "HEAD" \
               --mode "incremental" \
               --build-cmd "${BUILD_CMD}"
 
-            mkdir -p "${AST_STORE}/${COMMIT}"
-            rsync -a "$OUT/" "${AST_STORE}/${COMMIT}/"
+            # 커밋 결과도 임시 디렉터리에 먼저 저장
+            mkdir -p "${TMP_COMMIT}"
+            rsync -a --delete "$OUT/" "${TMP_COMMIT}/"
+
+            FINAL_COMMIT_DIR="${AST_ROOT}/${COMMIT}"
+
+            # 최종 커밋 디렉터리 원자적 교체(기존 있으면 백업 후 교체)
+            if [ -d "${FINAL_COMMIT_DIR}" ] && [ "$(ls -A "${FINAL_COMMIT_DIR}" 2>/dev/null || true)" != "" ]; then
+              COMMIT_BACKUP="${AST_ROOT}/.backup_commit_${COMMIT}_${TS}"
+              echo "[INCREMENTAL] 기존 커밋 결과 백업: ${FINAL_COMMIT_DIR} → ${COMMIT_BACKUP}"
+              mv "${FINAL_COMMIT_DIR}" "${COMMIT_BACKUP}"
+            fi
+
+            echo "[INCREMENTAL] 커밋 결과 원자적 교체: ${TMP_COMMIT} → ${FINAL_COMMIT_DIR}"
+            rm -rf "${FINAL_COMMIT_DIR}" || true
+            mv "${TMP_COMMIT}" "${FINAL_COMMIT_DIR}"
+
+            # 성공했으니 백업 정리(원하면 남겨도 됨)
+            if [ -n "${COMMIT_BACKUP:-}" ] && [ -d "${COMMIT_BACKUP}" ]; then
+              echo "[INCREMENTAL] 교체 성공 → 이전 커밋 결과 백업 정리: ${COMMIT_BACKUP}"
+              rm -rf "${COMMIT_BACKUP}"
+            fi
+
+            echo "[INCREMENTAL] 완료: ${FINAL_COMMIT_DIR}/summary.json 확인"
+            ls -la "${FINAL_COMMIT_DIR}" || true
           fi
+
+          # 성공 시 trap 해제(롤백 불필요)
+          trap - ERR
         '''
       }
+    }
+  }
+
+  post {
+    always {
+      echo "빌드 결과: ${currentBuild.currentResult}"
     }
   }
 }
