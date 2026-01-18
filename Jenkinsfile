@@ -69,10 +69,10 @@ pipeline {
           // - 따라서 여기서는 기존처럼 하드코딩된 관심 경로로만 변경 감지함.
           //   (정교하게 하려면 Groovy로 JSON 읽어서 regex를 만들 수도 있음)
           // ==========================================================
-          sh "git fetch origin main:refs/remotes/origin/main || true"
+          sh "git fetch origin master:refs/remotes/origin/master || true"
           def changed = sh(
             script: """
-              git diff --name-only origin/main..HEAD | \\
+              git diff --name-only origin/master..HEAD | \\
               grep -E '^(os/rt/|os/common/ports/ARMv6-M-RP2/|os/rt/templates/|os/oslib/src/|os/hal/src/)' || true
             """,
             returnStdout: true
@@ -496,8 +496,8 @@ PY
                 BASE_COMMIT=$(jq -r ".head_commit // .headCommit // empty" "${BASELINE_DIR}/summary.json" || true)
               fi
               if [ -z "${BASE_COMMIT}" ] || [ "${BASE_COMMIT}" = "null" ]; then
-                echo "[INCREMENTAL] baseline 기준 커밋을 못 읽음 → origin/main 사용"
-                BASE_REF="origin/main"
+                echo "[INCREMENTAL] baseline 기준 커밋을 못 읽음 → origin/master 사용"
+                BASE_REF="origin/master"
               else
                 BASE_REF="${BASE_COMMIT}"
                 echo "[INCREMENTAL] baseline 기준 커밋: ${BASE_REF}"
