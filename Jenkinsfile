@@ -1,4 +1,4 @@
-// Jenkinsfile (v10 보완본: AST 생성/감지/Include 경로를 설정파일(ast_paths.json)로 분리)
+// Jenkinsfile (v13 보완: merged AST 생성기 추가 + 설정 기반 TU 확장)
 pipeline {
   agent any
 
@@ -17,10 +17,7 @@ pipeline {
     // baseline에서 build-cmd 기본 비활성
     BUILD_CMD_BASELINE = ""
 
-    // ==========================================================
-    // [추가] AST 참고 경로 설정파일 경로
-    // - repo에서 이 파일만 수정/커밋하면, Jenkinsfile 수정 없이 경로 튜닝 가능
-    // ==========================================================
+    // AST 참고 경로 설정파일
     AST_PATHS_CONFIG = "tools/ast_ci/ast_paths.json"
   }
 
@@ -62,13 +59,8 @@ pipeline {
 
           def baselineExists = fileExists("${env.AST_STORE}/baseline/summary.json")
 
-          // ==========================================================
-          // [주의]
-          // - 이 단계는 "AST를 돌릴지 말지" 빠르게 결정하는 용도라,
-          //   설정파일을 아직 만들기 전(다음 stage에서 생성)일 수 있음.
-          // - 따라서 여기서는 기존처럼 하드코딩된 관심 경로로만 변경 감지함.
-          //   (정교하게 하려면 Groovy로 JSON 읽어서 regex를 만들 수도 있음)
-          // ==========================================================
+          // 변경 감지: Groovy에서 설정파일 JSON 파싱까지는 안 하고(단순),
+          // 관심 경로를 정규식으로 넉넉하게 감시
           sh "git fetch origin master:refs/remotes/origin/master || true"
           def changed = sh(
             script: """
@@ -123,15 +115,17 @@ pipeline {
           mkdir -p tools/ast_ci
 
           # ==========================================================
-          # [핵심] AST 참고 경로 설정파일 생성(없을 때만)
-          # - 이미 repo에 파일이 있으면 그대로 사용(덮어쓰지 않음)
-          # - 사용자는 이 파일만 수정해서 경로를 자유롭게 튜닝 가능
+          # AST 참고 경로 설정파일 생성(없을 때만)
+          # - tu_roots를 확장해서 callee 정의가 있는 TU들도 AST 생성 대상에 포함
           # ==========================================================
           if [ ! -f "${AST_PATHS_CONFIG}" ]; then
             cat > "${AST_PATHS_CONFIG}" << 'JSON'
 {
   "tu_roots": [
-    "os/rt/src"
+    "os/rt/src",
+    "os/oslib/src",
+    "os/hal/src",
+    "os/common/ports/ARMv6-M-RP2"
   ],
   "watched_prefixes": [
     "os/rt/",
@@ -163,15 +157,15 @@ JSON
             echo "[INFO] ${AST_PATHS_CONFIG} 가 존재하므로 해당 설정을 사용합니다."
           fi
 
+          # ==========================================================
+          # ast_build_and_diff.py 생성(기존 유지)
+          # ==========================================================
           cat > tools/ast_ci/ast_build_and_diff.py << 'PY'
 #!/usr/bin/env python3
 import argparse, json, subprocess, sys, hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 
-# ==========================================================
-# 유틸 함수들
-# ==========================================================
 def run(cmd: List[str], check: bool = True) -> str:
     p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and p.returncode != 0:
@@ -196,9 +190,6 @@ def list_changed_files(base: str, head: str) -> List[str]:
     out = run(["git","diff","--name-only",f"{base}..{head}"])
     return [x for x in out.splitlines() if x]
 
-# ==========================================================
-# 설정파일 로드
-# ==========================================================
 def load_config(path: str) -> Dict[str, Any]:
     p = Path(path)
     if not p.exists():
@@ -206,12 +197,8 @@ def load_config(path: str) -> Dict[str, Any]:
     try:
         return json.loads(p.read_text(encoding="utf-8", errors="ignore"))
     except Exception:
-        # 설정파일이 깨져 있어도 파이프라인이 즉시 죽지 않게 방어
         return {}
 
-# ==========================================================
-# compile_commands.json 생성/로드 (가능하면 사용)
-# ==========================================================
 def build_compile_db(build_cmd: str) -> bool:
     if not build_cmd.strip():
         return False
@@ -251,9 +238,6 @@ def filter_args(args: List[str]) -> List[str]:
             out.append(a); i+=1
     return out
 
-# ==========================================================
-# clang AST 덤프
-# ==========================================================
 def clang_ast(clang: str, src: str, flags: List[str]) -> Dict[str, Any]:
     cmd = [clang,"-Xclang","-ast-dump=json","-fsyntax-only",src] + flags
     return json.loads(run(cmd))
@@ -289,9 +273,6 @@ def diff_functions(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, List[str]]
         )
     }
 
-# ==========================================================
-# TU 선택 로직 (설정파일 기반)
-# ==========================================================
 def list_all_tus(root: Path, tu_roots: List[str]) -> List[Path]:
     tus: List[Path] = []
     for r in tu_roots:
@@ -307,17 +288,13 @@ def select_incremental_tus(
 ) -> List[Path]:
     tus: Set[Path] = set()
 
-    # 1) TU 루트들 아래에서 변경된 .c 는 해당 TU만 대상으로
     for p in changed:
         for tu_root in tu_roots:
             prefix = tu_root.rstrip("/") + "/"
             if p.startswith(prefix) and p.endswith(".c"):
                 tus.add(root / p)
 
-    # 2) 헤더 변경은 보수적으로 전체 TU 재생성
     header_changed = any(p.startswith(watched_header_prefixes) and p.endswith(".h") for p in changed)
-
-    # 3) 감시 경로(외부 의존 포함)에서 변경이 발생하면 전체 TU 재생성(보수적)
     dep_changed = any(p.startswith(watched_prefixes) for p in changed)
 
     if header_changed or dep_changed:
@@ -415,8 +392,176 @@ def main():
 if __name__ == "__main__":
     main()
 PY
-
           chmod +x tools/ast_ci/ast_build_and_diff.py
+
+          # ==========================================================
+          # [추가] merged AST 생성기(ast_merge.py) 생성
+          # ==========================================================
+          cat > tools/ast_ci/ast_merge.py << 'PY'
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
+def load_json(p: Path) -> Any:
+    return json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+
+def save_json(p: Path, obj: Any) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def walk(node: Any):
+    if isinstance(node, dict):
+        yield node
+        for c in node.get("inner", []) or []:
+            yield from walk(c)
+    elif isinstance(node, list):
+        for x in node:
+            yield from walk(x)
+
+def has_body(func_decl: Dict[str, Any]) -> bool:
+    for c in func_decl.get("inner", []) or []:
+        if isinstance(c, dict) and c.get("kind") == "CompoundStmt":
+            return True
+    kinds = [x.get("kind") for x in func_decl.get("inner", []) or [] if isinstance(x, dict)]
+    return "CompoundStmt" in kinds
+
+def index_functions(ast: Dict[str, Any], tu_rel: str) -> Dict[str, Tuple[str, Dict[str, Any]]]:
+    idx: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+    for n in walk(ast):
+        if isinstance(n, dict) and n.get("kind") == "FunctionDecl" and n.get("name"):
+            name = n["name"]
+            if name not in idx:
+                idx[name] = (tu_rel, n)
+            else:
+                _, old = idx[name]
+                if (not has_body(old)) and has_body(n):
+                    idx[name] = (tu_rel, n)
+    return idx
+
+def extract_callee_names(call_expr: Dict[str, Any]) -> List[str]:
+    names: List[str] = []
+    for n in walk(call_expr):
+        if not isinstance(n, dict):
+            continue
+        if n.get("kind") == "DeclRefExpr":
+            nm = n.get("name")
+            if nm:
+                names.append(nm)
+            ref = n.get("referencedDecl")
+            if isinstance(ref, dict) and ref.get("name"):
+                names.append(ref["name"])
+
+    seen = set()
+    out = []
+    for x in names:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def build_merged_function(
+    func_decl: Dict[str, Any],
+    func_idx: Dict[str, Tuple[str, Dict[str, Any]]],
+    max_depth: int,
+) -> Dict[str, Any]:
+    merged = json.loads(json.dumps(func_decl))
+
+    visited: Set[str] = set()
+    stack: List[Tuple[str, int]] = []
+
+    def enqueue_from(node: Dict[str, Any], depth: int):
+        for n in walk(node):
+            if isinstance(n, dict) and n.get("kind") == "CallExpr":
+                for callee in extract_callee_names(n):
+                    stack.append((callee, depth))
+
+    enqueue_from(func_decl, 1)
+
+    merged_callees: List[Dict[str, Any]] = []
+
+    while stack:
+        callee, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        if callee in visited:
+            continue
+        visited.add(callee)
+
+        if callee not in func_idx:
+            continue
+
+        callee_tu, callee_decl = func_idx[callee]
+        callee_copy = json.loads(json.dumps(callee_decl))
+
+        merged_callees.append({
+            "name": callee,
+            "tu": callee_tu,
+            "ast": callee_copy
+        })
+
+        enqueue_from(callee_decl, depth + 1)
+
+    merged["__merged_callees__"] = merged_callees
+    merged["__merged_meta__"] = {
+        "max_depth": max_depth,
+        "callee_count": len(merged_callees)
+    }
+    return merged
+
+def merge_one_side(out_dir: Path, side: str, max_depth: int) -> None:
+    ast_files = sorted(out_dir.rglob(f"*.{side}.ast.json"))
+
+    global_idx: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+    per_file_ast: Dict[Path, Dict[str, Any]] = {}
+
+    for f in ast_files:
+        ast = load_json(f)
+        per_file_ast[f] = ast
+
+        tu_rel = str(f.relative_to(out_dir)).replace(f".{side}.ast.json", "")
+        idx = index_functions(ast, tu_rel)
+        for k, v in idx.items():
+            if k not in global_idx:
+                global_idx[k] = v
+            else:
+                _, old = global_idx[k]
+                _, new = v
+                if (not has_body(old)) and has_body(new):
+                    global_idx[k] = v
+
+    for f, ast in per_file_ast.items():
+        merged_root = json.loads(json.dumps(ast))
+
+        merged_funcs: List[Dict[str, Any]] = []
+        for n in walk(ast):
+            if isinstance(n, dict) and n.get("kind") == "FunctionDecl" and n.get("name"):
+                merged_funcs.append(build_merged_function(n, global_idx, max_depth=max_depth))
+
+        merged_root["__merged_functions__"] = merged_funcs
+        merged_root["__merged_index_size__"] = len(global_idx)
+
+        out_file = f.with_name(f.name.replace(f".{side}.ast.json", f".{side}.merged.ast.json"))
+        save_json(out_file, merged_root)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", required=True)
+    ap.add_argument("--max-depth", type=int, default=3)
+    args = ap.parse_args()
+
+    out_dir = Path(args.dir).resolve()
+    if not out_dir.exists():
+        raise SystemExit(f"[ERROR] out_dir not found: {out_dir}")
+
+    merge_one_side(out_dir, "before", args.max_depth)
+    merge_one_side(out_dir, "after", args.max_depth)
+
+if __name__ == "__main__":
+    main()
+PY
+          chmod +x tools/ast_ci/ast_merge.py
         '''
       }
     }
@@ -469,6 +614,13 @@ PY
                 --build-cmd "${BASELINE_BUILD_CMD}" \
                 --config "${AST_PATHS_CONFIG}"
 
+              # ==========================================================
+              # [추가] merged AST 생성(확장 AST)
+              # - 결과: *.before.merged.ast.json / *.after.merged.ast.json
+              # ==========================================================
+              echo "[BASELINE] merged AST 생성 시작"
+              ${PY} tools/ast_ci/ast_merge.py --dir "$OUT" --max-depth 3
+
               mkdir -p "${TMP_BASE}"
               rsync -a --delete "$OUT/" "${TMP_BASE}/"
 
@@ -514,6 +666,12 @@ PY
                 --mode "incremental" \
                 --build-cmd "${BUILD_CMD}" \
                 --config "${AST_PATHS_CONFIG}"
+
+              # ==========================================================
+              # [추가] merged AST 생성(확장 AST)
+              # ==========================================================
+              echo "[INCREMENTAL] merged AST 생성 시작"
+              ${PY} tools/ast_ci/ast_merge.py --dir "$OUT" --max-depth 3
 
               mkdir -p "${TMP_COMMIT}"
               rsync -a --delete "$OUT/" "${TMP_COMMIT}/"
