@@ -1,0 +1,31 @@
+{
+  "watched_prefixes": [
+    "os/rt/",
+    "os/common/ports/ARMv6-M-RP2/",
+    "os/rt/templates/",
+    "os/oslib/src/",
+    "os/hal/src/"
+  ],
+  "extra_dep_prefixes": [
+    "os/common/ports/ARMv6-M-RP2/",
+    "os/rt/templates/",
+    "os/oslib/src/",
+    "os/hal/src/"
+  ],
+  "extra_dep_headers": [
+    "os/common/ports/ARMv6-M-RP2/",
+    "os/rt/templates/",
+    "os/oslib/include/",
+    "os/hal/include/"
+  ],
+  "rt_tu_root": "os/rt/src",
+  "fallback_includes": [
+    "-Ios/rt/include",
+    "-Ios/rt/templates",
+    "-Ios/common/ports/ARMv6-M-RP2",
+    "-Ios/oslib/include",
+    "-Ios/oslib/src",
+    "-Ios/hal/include",
+    "-Ios/hal/src"
+  ]
+}
