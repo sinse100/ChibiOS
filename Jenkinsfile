@@ -1,4 +1,4 @@
-// Jenkinsfile (v13 보완: merged AST 생성기 추가 + 설정 기반 TU 확장)
+// Jenkinsfile (v14 FIX: chlicense.h include 경로 보강 + 없으면 더미 생성)
 pipeline {
   agent any
 
@@ -59,7 +59,6 @@ pipeline {
 
           def baselineExists = fileExists("${env.AST_STORE}/baseline/summary.json")
 
-          // 변경 감지: Groovy에서 설정파일 JSON 파싱까지는 안 하고(단순),
           // 관심 경로를 정규식으로 넉넉하게 감시
           sh "git fetch origin master:refs/remotes/origin/master || true"
           def changed = sh(
@@ -115,8 +114,26 @@ pipeline {
           mkdir -p tools/ast_ci
 
           # ==========================================================
+          # [추가] chlicense.h가 저장소에 없을 수도 있으니(또는 경로가 다를 수 있으니)
+          #        AST 파싱만 통과시키기 위한 더미 헤더를 생성
+          #        (실제 파일이 있으면 아무것도 안 함)
+          # ==========================================================
+          mkdir -p tools/ast_ci/generated
+          if [ ! -f "chlicense.h" ] && [ ! -f "os/license/chlicense.h" ]; then
+            cat > tools/ast_ci/generated/chlicense.h << 'H'
+#ifndef CHLICENSE_H
+#define CHLICENSE_H
+/* AST 파싱용 더미 헤더: 라이선스/배너 정의가 필요한 경우 여기에 최소 정의를 추가 */
+#endif
+H
+            echo "[INFO] chlicense.h가 트리에 없어서 더미 헤더를 생성했습니다: tools/ast_ci/generated/chlicense.h"
+          else
+            echo "[INFO] chlicense.h가 트리에 존재합니다(더미 생성 생략)."
+          fi
+
+          # ==========================================================
           # AST 참고 경로 설정파일 생성(없을 때만)
-          # - tu_roots를 확장해서 callee 정의가 있는 TU들도 AST 생성 대상에 포함
+          # - 핵심 수정: chlicense.h 탐색을 위해 os/license 및 generated include 추가
           # ==========================================================
           if [ ! -f "${AST_PATHS_CONFIG}" ]; then
             cat > "${AST_PATHS_CONFIG}" << 'JSON'
@@ -139,9 +156,12 @@ pipeline {
     "os/common/ports/ARMv6-M-RP2/",
     "os/rt/templates/",
     "os/oslib/include/",
-    "os/hal/include/"
+    "os/hal/include/",
+    "os/license/"
   ],
   "fallback_includes": [
+    "-Itools/ast_ci/generated",
+    "-Ios/license",
     "-Ios/rt/include",
     "-Ios/rt/templates",
     "-Ios/common/ports/ARMv6-M-RP2",
@@ -395,7 +415,7 @@ PY
           chmod +x tools/ast_ci/ast_build_and_diff.py
 
           # ==========================================================
-          # [추가] merged AST 생성기(ast_merge.py) 생성
+          # merged AST 생성기(ast_merge.py) 생성(기존 유지)
           # ==========================================================
           cat > tools/ast_ci/ast_merge.py << 'PY'
 #!/usr/bin/env python3
@@ -614,10 +634,6 @@ PY
                 --build-cmd "${BASELINE_BUILD_CMD}" \
                 --config "${AST_PATHS_CONFIG}"
 
-              # ==========================================================
-              # [추가] merged AST 생성(확장 AST)
-              # - 결과: *.before.merged.ast.json / *.after.merged.ast.json
-              # ==========================================================
               echo "[BASELINE] merged AST 생성 시작"
               ${PY} tools/ast_ci/ast_merge.py --dir "$OUT" --max-depth 3
 
@@ -667,9 +683,6 @@ PY
                 --build-cmd "${BUILD_CMD}" \
                 --config "${AST_PATHS_CONFIG}"
 
-              # ==========================================================
-              # [추가] merged AST 생성(확장 AST)
-              # ==========================================================
               echo "[INCREMENTAL] merged AST 생성 시작"
               ${PY} tools/ast_ci/ast_merge.py --dir "$OUT" --max-depth 3
 
