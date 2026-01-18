@@ -1,33 +1,27 @@
-// Jenkinsfile (v09 보완본: os/rt 외부 의존 경로까지 고려 + *.ast.json 생성)
+// Jenkinsfile (v10 보완본: AST 생성/감지/Include 경로를 설정파일(ast_paths.json)로 분리)
 pipeline {
   agent any
 
   options {
-    // 플러그인 의존 옵션은 환경에 따라 파싱 실패할 수 있어 기본 비활성 권장
-    // timestamps()
-    // ansiColor('xterm')
     buildDiscarder(logRotator(numToKeepStr: '30'))
   }
 
   environment {
-    // AST 결과를 서버에 영구 저장할 경로 (Jenkins 실행 계정이 쓰기 권한을 가져야 함)
     AST_STORE = "/var/lib/jenkins/ast/chibios-os-rt"
 
-    // 사용 도구
     CLANG = "clang"
     PY = "python3"
 
-    // ⚠️ 실제 ChibiOS RT 빌드에 맞게 조정 필요 (compile_commands.json 생성 목적)
     BUILD_CMD = "make -C testrt"
 
-    // ==========================================================
-    // [baseline에서 build-cmd 기본 비활성]
-    // - baseline은 처음 1회 전체 TU를 다 도는 구간이라 시간이 길어짐
-    // - bear + make가 더 오래 걸릴 수 있어서 기본은 ""(비활성)
-    // - 필요하면 아래 값을 BUILD_CMD와 같게 바꿔서 켜면 됨
-    //   예: BUILD_CMD_BASELINE = "make -C testrt"
-    // ==========================================================
+    // baseline에서 build-cmd 기본 비활성
     BUILD_CMD_BASELINE = ""
+
+    // ==========================================================
+    // [추가] AST 참고 경로 설정파일 경로
+    // - repo에서 이 파일만 수정/커밋하면, Jenkinsfile 수정 없이 경로 튜닝 가능
+    // ==========================================================
+    AST_PATHS_CONFIG = "tools/ast_ci/ast_paths.json"
   }
 
   triggers {
@@ -47,11 +41,6 @@ pipeline {
       steps {
         sh '''
           set -eux
-          # ==========================================================
-          # Jenkinsfile에서 apt 설치를 위해 sudo를 사용하므로,
-          # jenkins 유저가 비밀번호 없이 sudo 실행 가능해야 함(NOPASSWD).
-          # -n 옵션으로 "비밀번호 요구" 시 즉시 실패하게 함.
-          # ==========================================================
           if sudo -n true 2>/dev/null; then
             echo "[OK] jenkins 계정이 비밀번호 없이 sudo 사용 가능"
           else
@@ -69,27 +58,18 @@ pipeline {
     stage('AST 실행 여부 판단') {
       steps {
         script {
-          // baseline 디렉터리 보장
           sh "mkdir -p '${env.AST_STORE}/baseline'"
 
-          // ==========================================================
-          // [BASELINE 존재 여부 판단]
-          // - 최초 실행이거나 ${AST_STORE}/baseline/summary.json 이 없으면
-          //   → baseline AST를 처음부터 생성해야 함
-          // ==========================================================
           def baselineExists = fileExists("${env.AST_STORE}/baseline/summary.json")
 
           // ==========================================================
-          // [변경 사항 감지 범위 확대]
-          // - 기존: os/rt/** 변경만 감지
-          // - 보완: os/rt가 참조하는 외부 선언/정의 경로 변경도 감지
-          //   * os/common/ports/ARMv6-M-RP2/**
-          //   * os/rt/templates/**
-          //   * os/oslib/src/**
-          //   * os/hal/src/**
+          // [주의]
+          // - 이 단계는 "AST를 돌릴지 말지" 빠르게 결정하는 용도라,
+          //   설정파일을 아직 만들기 전(다음 stage에서 생성)일 수 있음.
+          // - 따라서 여기서는 기존처럼 하드코딩된 관심 경로로만 변경 감지함.
+          //   (정교하게 하려면 Groovy로 JSON 읽어서 regex를 만들 수도 있음)
           // ==========================================================
           sh "git fetch origin main:refs/remotes/origin/main || true"
-
           def changed = sh(
             script: """
               git diff --name-only origin/main..HEAD | \\
@@ -103,7 +83,7 @@ pipeline {
             env.DO_AST = "1"
             env.AST_MODE = "baseline"
           } else if (changed == "") {
-            echo "관심 경로(os/rt + 외부 의존 경로) 변경 없음 → AST 단계 스킵"
+            echo "관심 경로 변경 없음 → AST 단계 스킵"
             env.DO_AST = "0"
           } else {
             echo "관심 경로 변경 감지 → incremental AST 수행"
@@ -121,10 +101,6 @@ pipeline {
           set -eux
           export DEBIAN_FRONTEND=noninteractive
 
-          # ==========================================================
-          # [시간 최적화]
-          # - 이미 도구가 설치돼 있으면 apt 단계를 스킵해서 시간을 크게 줄임
-          # ==========================================================
           if command -v clang >/dev/null \
              && command -v bear  >/dev/null \
              && command -v jq    >/dev/null \
@@ -146,11 +122,52 @@ pipeline {
           set -eux
           mkdir -p tools/ast_ci
 
+          # ==========================================================
+          # [핵심] AST 참고 경로 설정파일 생성(없을 때만)
+          # - 이미 repo에 파일이 있으면 그대로 사용(덮어쓰지 않음)
+          # - 사용자는 이 파일만 수정해서 경로를 자유롭게 튜닝 가능
+          # ==========================================================
+          if [ ! -f "${AST_PATHS_CONFIG}" ]; then
+            cat > "${AST_PATHS_CONFIG}" << 'JSON'
+{
+  "tu_roots": [
+    "os/rt/src"
+  ],
+  "watched_prefixes": [
+    "os/rt/",
+    "os/common/ports/ARMv6-M-RP2/",
+    "os/rt/templates/",
+    "os/oslib/src/",
+    "os/hal/src/"
+  ],
+  "watched_header_prefixes": [
+    "os/rt/include/",
+    "os/common/ports/ARMv6-M-RP2/",
+    "os/rt/templates/",
+    "os/oslib/include/",
+    "os/hal/include/"
+  ],
+  "fallback_includes": [
+    "-Ios/rt/include",
+    "-Ios/rt/templates",
+    "-Ios/common/ports/ARMv6-M-RP2",
+    "-Ios/oslib/include",
+    "-Ios/oslib/src",
+    "-Ios/hal/include",
+    "-Ios/hal/src"
+  ]
+}
+JSON
+            echo "[INFO] ${AST_PATHS_CONFIG} 가 없어서 기본값으로 생성했습니다. 필요하면 이 파일만 수정하세요."
+          else
+            echo "[INFO] ${AST_PATHS_CONFIG} 가 존재하므로 해당 설정을 사용합니다."
+          fi
+
           cat > tools/ast_ci/ast_build_and_diff.py << 'PY'
 #!/usr/bin/env python3
 import argparse, json, subprocess, sys, hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 # ==========================================================
 # 유틸 함수들
@@ -180,10 +197,22 @@ def list_changed_files(base: str, head: str) -> List[str]:
     return [x for x in out.splitlines() if x]
 
 # ==========================================================
+# 설정파일 로드
+# ==========================================================
+def load_config(path: str) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        # 설정파일이 깨져 있어도 파이프라인이 즉시 죽지 않게 방어
+        return {}
+
+# ==========================================================
 # compile_commands.json 생성/로드 (가능하면 사용)
 # ==========================================================
 def build_compile_db(build_cmd: str) -> bool:
-    # build_cmd가 비어있으면 아예 수행하지 않음(시간 절약)
     if not build_cmd.strip():
         return False
     _ = run_shell(f"bear -- {build_cmd}")
@@ -201,14 +230,12 @@ def read_compile_db() -> Dict[str, List[str]]:
             continue
         absf = str(Path(fp).resolve())
         args = e.get("arguments") or e.get("command","").split()
-        # 컴파일러 제거(첫 토큰이 컴파일러인 경우가 많음)
         if args and (args[0].endswith("clang") or args[0].endswith("gcc") or args[0].endswith("cc")):
             args = args[1:]
         mapping[absf] = args
     return mapping
 
 def filter_args(args: List[str]) -> List[str]:
-    # 빌드 플래그 중 clang AST에 불필요/위험한 항목 제거
     skip = {"-c","-MMD","-MP"}
     out: List[str] = []
     i=0
@@ -263,53 +290,41 @@ def diff_functions(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, List[str]]
     }
 
 # ==========================================================
-# TU 선택 로직
+# TU 선택 로직 (설정파일 기반)
 # ==========================================================
-EXTRA_DEP_PREFIXES = (
-    "os/common/ports/ARMv6-M-RP2/",
-    "os/rt/templates/",
-    "os/oslib/src/",
-    "os/hal/src/",
-)
+def list_all_tus(root: Path, tu_roots: List[str]) -> List[Path]:
+    tus: List[Path] = []
+    for r in tu_roots:
+        tus.extend((root / r).rglob("*.c"))
+    return sorted(set(tus))
 
-EXTRA_DEP_HEADERS = (
-    "os/common/ports/ARMv6-M-RP2/",
-    "os/rt/templates/",
-    "os/oslib/include/",
-    "os/hal/include/",
-)
-
-def list_all_rt_tus(root: Path) -> List[Path]:
-    return sorted((root/"os/rt/src").rglob("*.c"))
-
-def select_incremental_tus(changed: List[str], root: Path) -> List[Path]:
+def select_incremental_tus(
+    changed: List[str],
+    root: Path,
+    tu_roots: List[str],
+    watched_prefixes: Tuple[str, ...],
+    watched_header_prefixes: Tuple[str, ...],
+) -> List[Path]:
     tus: Set[Path] = set()
 
-    # 1) os/rt/src 에서 변경된 .c 는 해당 TU만 대상으로
+    # 1) TU 루트들 아래에서 변경된 .c 는 해당 TU만 대상으로
     for p in changed:
-        if p.startswith("os/rt/src/") and p.endswith(".c"):
-            tus.add(root/p)
+        for tu_root in tu_roots:
+            prefix = tu_root.rstrip("/") + "/"
+            if p.startswith(prefix) and p.endswith(".c"):
+                tus.add(root / p)
 
     # 2) 헤더 변경은 보수적으로 전체 TU 재생성
-    header_changed = any(
-        (p.startswith("os/rt/include/") and p.endswith(".h")) or
-        (p.startswith(EXTRA_DEP_HEADERS) and p.endswith(".h"))
-        for p in changed
-    )
+    header_changed = any(p.startswith(watched_header_prefixes) and p.endswith(".h") for p in changed)
 
-    # 3) 외부 의존 경로(추가 폴더)에서 변경이 발생하면
-    #    "어떤 TU가 영향을 받는지" 정밀 분석을 아직 하지 않는 대신,
-    #    안전하게 os/rt/src 전체 TU를 대상으로 재생성(보수적)
-    dep_changed = any(p.startswith(EXTRA_DEP_PREFIXES) for p in changed)
+    # 3) 감시 경로(외부 의존 포함)에서 변경이 발생하면 전체 TU 재생성(보수적)
+    dep_changed = any(p.startswith(watched_prefixes) for p in changed)
 
     if header_changed or dep_changed:
-        tus |= set(list_all_rt_tus(root))
+        tus |= set(list_all_tus(root, tu_roots))
 
     return sorted(tus)
 
-# ==========================================================
-# 메인
-# ==========================================================
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", required=True)
@@ -318,22 +333,15 @@ def main():
     ap.add_argument("--mode", choices=["baseline","incremental"], required=True)
     ap.add_argument("--clang", default="clang")
     ap.add_argument("--build-cmd", default="")
-
-    # ==========================================================
-    # [fallback includes 보완]
-    # - os/rt 외부 선언/정의가 위치할 수 있는 폴더까지 include 경로를 넓힘
-    # - 실제 프로젝트에서 더 필요한 include가 있으면 여기에 추가하면 됨
-    # ==========================================================
-    ap.add_argument("--fallback-includes", nargs="*", default=[
-        "-Ios/rt/include",
-        "-Ios/rt/templates",
-        "-Ios/common/ports/ARMv6-M-RP2",
-        "-Ios/oslib/include",
-        "-Ios/oslib/src",
-        "-Ios/hal/include",
-        "-Ios/hal/src",
-    ])
+    ap.add_argument("--config", default="tools/ast_ci/ast_paths.json")
     args = ap.parse_args()
+
+    cfg = load_config(args.config)
+
+    tu_roots = cfg.get("tu_roots") or ["os/rt/src"]
+    watched_prefixes = tuple(cfg.get("watched_prefixes") or ["os/rt/"])
+    watched_header_prefixes = tuple(cfg.get("watched_header_prefixes") or ["os/rt/include/"])
+    fallback_includes = cfg.get("fallback_includes") or ["-Ios/rt/include"]
 
     root = Path(".").resolve()
     out = Path(args.outdir); out.mkdir(parents=True, exist_ok=True)
@@ -345,27 +353,28 @@ def main():
     if args.build_cmd and build_compile_db(args.build_cmd):
         compile_db = read_compile_db()
 
-    # MODE 분기
     if args.mode == "baseline":
-        tus = list_all_rt_tus(root)
+        tus = list_all_tus(root, tu_roots)
         changed_files = ["(baseline 초기 생성)"]
     else:
         changed_files = list_changed_files(args.base, args.head)
-        tus = select_incremental_tus(changed_files, root)
+        tus = select_incremental_tus(
+            changed_files, root,
+            tu_roots=tu_roots,
+            watched_prefixes=watched_prefixes,
+            watched_header_prefixes=watched_header_prefixes,
+        )
 
     results = []
     for tu in tus:
         rel = tu.relative_to(root)
 
-        # before/after 소스 덤프 경로
         before_c = out / f"{rel}.before.c"
         after_c  = out / f"{rel}.after.c"
 
-        # before/after AST json 경로(요구사항 반영)
         before_ast = out / f"{rel}.before.ast.json"
         after_ast  = out / f"{rel}.after.ast.json"
 
-        # diff 결과 경로
         diffp  = out / f"{rel}.diff.json"
 
         ensure_parent(before_c); ensure_parent(after_c)
@@ -375,13 +384,12 @@ def main():
         before_c.write_text(run(["git","show",f"{base_commit}:{rel}"], check=False), encoding="utf-8", errors="ignore")
         after_c.write_text(run(["git","show",f"{head_commit}:{rel}"], check=False), encoding="utf-8", errors="ignore")
 
-        flags = compile_db.get(str(tu.resolve()), args.fallback_includes)
+        flags = compile_db.get(str(tu.resolve()), fallback_includes)
         flags = filter_args(flags)
 
         ast_b = clang_ast(args.clang, str(before_c), flags)
         ast_a = clang_ast(args.clang, str(after_c),  flags)
 
-        # 요구사항: *.ast.json 생성
         before_ast.write_text(json.dumps(ast_b, indent=2), encoding="utf-8")
         after_ast.write_text(json.dumps(ast_a, indent=2), encoding="utf-8")
 
@@ -394,6 +402,11 @@ def main():
         "mode": args.mode,
         "base_commit": base_commit,
         "head_commit": head_commit,
+        "config": args.config,
+        "tu_roots": tu_roots,
+        "watched_prefixes": list(watched_prefixes),
+        "watched_header_prefixes": list(watched_header_prefixes),
+        "fallback_includes": fallback_includes,
         "changed_files": changed_files,
         "results": results
     }
@@ -410,15 +423,9 @@ PY
 
     stage('AST 생성 및 diff (롤백 포함)') {
       when { expression { return env.DO_AST == "1" } }
-
-      // 무한 대기 방지
       options { timeout(time: 25, unit: 'MINUTES') }
 
       steps {
-        // ==========================================================
-        // [중요] Jenkins sh는 /bin/sh(dash)인 경우가 많아서 pipefail이 깨질 수 있음
-        // → bash -lc로 강제 실행
-        // ==========================================================
         sh '''
           bash -lc '
             set -euo pipefail
@@ -452,7 +459,6 @@ PY
 
               echo "[BASELINE] 전체 TU AST 생성 시작"
 
-              # baseline build-cmd: 기본은 비활성(시간 절약)
               BASELINE_BUILD_CMD="${BUILD_CMD_BASELINE:-}"
 
               ${PY} tools/ast_ci/ast_build_and_diff.py \
@@ -460,7 +466,8 @@ PY
                 --base "HEAD" \
                 --head "HEAD" \
                 --mode "baseline" \
-                --build-cmd "${BASELINE_BUILD_CMD}"
+                --build-cmd "${BASELINE_BUILD_CMD}" \
+                --config "${AST_PATHS_CONFIG}"
 
               mkdir -p "${TMP_BASE}"
               rsync -a --delete "$OUT/" "${TMP_BASE}/"
@@ -505,7 +512,8 @@ PY
                 --base "${BASE_REF}" \
                 --head "HEAD" \
                 --mode "incremental" \
-                --build-cmd "${BUILD_CMD}"
+                --build-cmd "${BUILD_CMD}" \
+                --config "${AST_PATHS_CONFIG}"
 
               mkdir -p "${TMP_COMMIT}"
               rsync -a --delete "$OUT/" "${TMP_COMMIT}/"
