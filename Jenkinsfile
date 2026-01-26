@@ -6,157 +6,134 @@ pipeline {
   }
 
   options {
-    timestamps()
-    ansiColor('xterm')
     disableConcurrentBuilds()
+    timeout(time: 60, unit: 'MINUTES')
   }
 
   environment {
-    SRC_DIR  = "os/rt/src"
-    INC_DIR  = "os/rt/include"
-    OUT_DIR  = "artifacts"
-    PY       = "python3"
-    CLANG    = "clang"
+    SRC_DIR = "os/rt/src"
+    INC_DIR = "os/rt/include"
+    OUT_DIR = "ast_out"
+    CLANG_BIN = "clang"
+    PY = "python3"
   }
 
   stages {
     stage('Checkout') {
       steps {
         checkout scm
+        sh 'git rev-parse --short HEAD > GIT_SHA.txt'
       }
     }
 
     stage('Prepare workspace') {
       steps {
-        sh '''
-          set -eux
-          mkdir -p "${OUT_DIR}"/{ast_json,neo4j_ast,neo4j_dfd,logs}
-        '''
+        sh """
+          set -euxo pipefail
+          mkdir -p ${OUT_DIR}/ast_json
+          mkdir -p ${OUT_DIR}/merged
+          mkdir -p ${OUT_DIR}/neo4j
+          mkdir -p ${OUT_DIR}/dfd
+        """
       }
     }
 
-    stage('Generate AST JSON per C file') {
+    stage('Write helper scripts') {
       steps {
-        // Python script that:
-        // - finds .c/.h in SRC_DIR/INC_DIR
-        // - runs clang AST dump json for each .c (and optionally headers if you want)
-        // - outputs JSON files under OUT_DIR/ast_json
-        writeFile file: 'gen_ast_json.py', text: '''
+        writeFile file: "${OUT_DIR}/extract_ast.py", text: '''\
 #!/usr/bin/env python3
 import os, sys, json, subprocess, hashlib
 from pathlib import Path
 
+CLANG = os.environ.get("CLANG_BIN", "clang")
 SRC_DIR = os.environ.get("SRC_DIR", "os/rt/src")
 INC_DIR = os.environ.get("INC_DIR", "os/rt/include")
-OUT_DIR = os.environ.get("OUT_DIR", "artifacts")
-CLANG   = os.environ.get("CLANG", "clang")
+OUT_DIR = os.environ.get("OUT_DIR", "ast_out")
 
-AST_OUT = Path(OUT_DIR) / "ast_json"
-LOG_OUT = Path(OUT_DIR) / "logs"
-AST_OUT.mkdir(parents=True, exist_ok=True)
-LOG_OUT.mkdir(parents=True, exist_ok=True)
+TARGET_DIRS = [SRC_DIR, INC_DIR]
+EXTS = {".c", ".h"}
 
-def sha1(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+def run(cmd):
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return p.returncode, p.stdout, p.stderr
 
-def run_clang_ast_dump_json(c_path: Path) -> Path:
-    out_json = AST_OUT / f"{c_path.name}.{sha1(str(c_path))}.ast.json"
-    out_log  = LOG_OUT / f"{c_path.name}.{sha1(str(c_path))}.clang.log"
+def file_hash(p: Path) -> str:
+    h = hashlib.sha1()
+    with p.open("rb") as f:
+        while True:
+            b = f.read(1024 * 1024)
+            if not b: break
+            h.update(b)
+    return h.hexdigest()
 
-    # NOTE:
-    # - We intentionally add include paths for both SRC_DIR and INC_DIR.
-    # - If your project needs additional -D or -I, extend EXTRA_ARGS below.
-    extra_args = []
+def clang_ast_dump_json(src: Path, out_json: Path):
+    # -fsyntax-only 로 컴파일 산출물 없이 AST만
+    # 헤더는 TU로 parsing하기 까다로워서, 여기서는 .h도 일단 AST dump는 시도하되
+    # 실사용은 주로 .c TU 기준(함수 body 포함)으로 병합/DFD를 만들게 됨.
     cmd = [
         CLANG,
-        "-Xclang", "-ast-dump=json",
         "-fsyntax-only",
-        "-I", INC_DIR,
-        "-I", SRC_DIR,
-        *extra_args,
-        str(c_path)
+        "-Xclang", "-ast-dump=json",
+        "-I", str(Path(INC_DIR).resolve()),
+        "-I", str(Path(SRC_DIR).resolve()),
+        str(src),
     ]
-
-    with out_log.open("w", encoding="utf-8") as lf:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=lf)
-    if p.returncode != 0:
-        # If clang fails, we still keep the log and skip that file.
-        return None
-
-    out_json.write_bytes(p.stdout)
-    return out_json
-
-def iter_files(root: Path, exts):
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in exts:
-            yield p
+    rc, out, err = run(cmd)
+    if rc != 0:
+        return False, err.strip()
+    out_json.write_text(out, encoding="utf-8")
+    return True, ""
 
 def main():
-    src_root = Path(SRC_DIR)
-    inc_root = Path(INC_DIR)
+    repo_root = Path(".").resolve()
+    out_root = Path(OUT_DIR).resolve() / "ast_json"
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    c_files = list(iter_files(src_root, {".c"}))
-    if not c_files:
-      print(f"[WARN] No .c files under {SRC_DIR}", file=sys.stderr)
+    targets = []
+    for d in TARGET_DIRS:
+        base = repo_root / d
+        if not base.exists():
+            continue
+        for p in base.rglob("*"):
+            if p.is_file() and p.suffix in EXTS:
+                targets.append(p)
 
-    ok = 0
-    for c in c_files:
-        j = run_clang_ast_dump_json(c)
-        if j:
-            ok += 1
-            print(f"[OK] AST JSON: {c} -> {j}")
+    manifest = {
+        "repo_root": str(repo_root),
+        "targets": [],
+        "errors": []
+    }
+
+    for p in sorted(targets):
+        rel = p.relative_to(repo_root)
+        h = file_hash(p)
+        out_json = out_root / (str(rel).replace("/", "__") + f".{h}.ast.json")
+        ok, msg = clang_ast_dump_json(p, out_json)
+        item = {"path": str(rel), "hash": h, "ast_json": str(out_json.relative_to(repo_root))}
+        if ok:
+            manifest["targets"].append(item)
         else:
-            print(f"[SKIP] clang failed: {c} (see logs)", file=sys.stderr)
+            item["error"] = msg
+            manifest["errors"].append(item)
 
-    print(f"[DONE] generated {ok}/{len(c_files)} AST json files")
+    (Path(OUT_DIR)/"ast_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[OK] AST dump complete. success={len(manifest['targets'])}, failed={len(manifest['errors'])}")
+    if manifest["errors"]:
+        print("[WARN] Some files failed to parse; see ast_manifest.json")
 
 if __name__ == "__main__":
     main()
 '''
-        sh '''
-          set -eux
-          chmod +x gen_ast_json.py
-          "${PY}" gen_ast_json.py
-        '''
-      }
-    }
-
-    stage('Merge ASTs (caller <- callee) & Build DFD') {
-      steps {
-        // This script:
-        // - parses clang AST json
-        // - extracts function defs, builds call graph inside (SRC_DIR, INC_DIR)
-        // - merges: expand callee AST nodes into caller merged tree (best-effort)
-        // - skips callees not found within dirs (per your current algorithm constraint)
-        // - produces Neo4J CSV for:
-        //   (a) AST graph representation
-        //   (b) DFD representation (nodes=functions, flows=call/return)
-        writeFile file: 'merge_and_export_neo4j.py', text: '''
+        writeFile file: "${OUT_DIR}/build_graphs.py", text: '''\
 #!/usr/bin/env python3
-import os, json, re, hashlib
+import os, json, re
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Set, Optional
+from typing import Dict, Any, List, Set, Tuple
 
-SRC_DIR = os.environ.get("SRC_DIR", "os/rt/src")
-INC_DIR = os.environ.get("INC_DIR", "os/rt/include")
-OUT_DIR = os.environ.get("OUT_DIR", "artifacts")
+OUT_DIR = os.environ.get("OUT_DIR", "ast_out")
 
-AST_JSON_DIR = Path(OUT_DIR) / "ast_json"
-NEO4J_AST_DIR = Path(OUT_DIR) / "neo4j_ast"
-NEO4J_DFD_DIR = Path(OUT_DIR) / "neo4j_dfd"
-NEO4J_AST_DIR.mkdir(parents=True, exist_ok=True)
-NEO4J_DFD_DIR.mkdir(parents=True, exist_ok=True)
-
-def sha1(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
-
-def stable_id(*parts: str) -> str:
-    raw = "::".join(parts)
-    return sha1(raw)
-
-def is_under_dirs(path: str) -> bool:
-    # clang nodes may include absolute paths; we match substrings.
-    return (f"/{SRC_DIR}/" in path) or (f"/{INC_DIR}/" in path) or path.endswith(f"/{SRC_DIR}") or path.endswith(f"/{INC_DIR}")
+def load_json(p: Path) -> Any:
+    return json.loads(p.read_text(encoding="utf-8", errors="ignore"))
 
 def walk(node: Any):
     if isinstance(node, dict):
@@ -165,421 +142,322 @@ def walk(node: Any):
             if isinstance(v, (dict, list)):
                 yield from walk(v)
     elif isinstance(node, list):
-        for it in node:
-            yield from walk(it)
+        for x in node:
+            yield from walk(x)
 
-def get_loc_file(n: Dict[str, Any]) -> Optional[str]:
-    loc = n.get("loc") or {}
-    file = loc.get("file")
-    if isinstance(file, str):
-        return file
-    return None
+def get_loc_key(d: Dict[str, Any]) -> str:
+    loc = d.get("loc") or d.get("range", {}).get("begin")
+    if not loc: return ""
+    # loc may contain file/line/col
+    f = loc.get("file", "")
+    line = loc.get("line", "")
+    col = loc.get("col", "")
+    return f"{f}:{line}:{col}"
 
-def extract_functions(ast_root: Dict[str, Any]) -> List[Dict[str, Any]]:
-    funcs = []
-    for n in walk(ast_root):
+def extract_functions(ast: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    반환: { funcName: { 'name', 'params':[...], 'returns':[...], 'calls':[ {callee, args:[...]} ] } }
+    - 함수 정의(FunctionDecl with 'inner' including CompoundStmt)가 주 대상
+    """
+    funcs: Dict[str, Dict[str, Any]] = {}
+
+    for n in walk(ast):
         if not isinstance(n, dict): 
             continue
-        if n.get("kind") == "FunctionDecl":
-            # In clang AST json, function definitions often have "isImplicit" false and have "inner" etc.
-            # We prefer nodes that appear to be definitions (have body in 'inner' with CompoundStmt)
-            name = n.get("name")
-            if not name:
+        if n.get("kind") != "FunctionDecl":
+            continue
+
+        name = n.get("name")
+        if not name:
+            continue
+
+        inner = n.get("inner", [])
+        has_body = any(isinstance(x, dict) and x.get("kind") in ("CompoundStmt", "CXXTryStmt") for x in inner)
+        if not has_body:
+            # 선언만 있는 경우(특히 헤더)도 params 추출은 가능하지만, return/call은 제한됨
+            pass
+
+        # params
+        params = []
+        for x in inner:
+            if isinstance(x, dict) and x.get("kind") == "ParmVarDecl":
+                pn = x.get("name")
+                if pn:
+                    params.append(pn)
+
+        funcs.setdefault(name, {"name": name, "params": params, "returns": [], "calls": [], "has_body": has_body})
+
+        # calls + returns (only meaningful if body exists)
+        # calls: CallExpr -> referenced function name is often in 'inner' via DeclRefExpr
+        for x in walk(n):
+            if not isinstance(x, dict): 
                 continue
-            funcs.append(n)
+            if x.get("kind") == "CallExpr":
+                callee = None
+                args = []
+                inn = x.get("inner", [])
+                # first inner often is callee expr
+                if inn:
+                    # find DeclRefExpr or MemberExpr inside first child
+                    for y in walk(inn[0]):
+                        if isinstance(y, dict) and y.get("kind") == "DeclRefExpr":
+                            callee = y.get("referencedDecl", {}).get("name") or y.get("name")
+                            if callee:
+                                break
+                # remaining inners are args (roughly)
+                if len(inn) >= 2:
+                    for a in inn[1:]:
+                        # try extract variable/const tokens
+                        token = extract_expr_token(a)
+                        if token:
+                            args.append(token)
+                if callee:
+                    funcs[name]["calls"].append({"callee": callee, "args": args})
+
+            if x.get("kind") == "ReturnStmt":
+                inn = x.get("inner", [])
+                if not inn:
+                    continue
+                token = extract_expr_token(inn[0])
+                if token:
+                    funcs[name]["returns"].append(token)
+
+    # dedup returns
+    for f in funcs.values():
+        f["returns"] = sorted(set([r for r in f["returns"] if r]))
     return funcs
 
-def is_function_definition(fn: Dict[str, Any]) -> bool:
-    # heuristic: has 'inner' containing 'CompoundStmt'
-    inn = fn.get("inner", [])
-    if not isinstance(inn, list): 
-        return False
-    for c in inn:
-        if isinstance(c, dict) and c.get("kind") == "CompoundStmt":
-            return True
-    return False
-
-def extract_calls(fn: Dict[str, Any]) -> List[Dict[str, Any]]:
-    calls = []
-    for n in walk(fn):
-        if not isinstance(n, dict): 
-            continue
-        if n.get("kind") == "CallExpr":
-            calls.append(n)
-    return calls
-
-def callee_name_from_call(call: Dict[str, Any]) -> Optional[str]:
-    # CallExpr typically has 'inner' with 'DeclRefExpr' or 'MemberExpr' etc.
-    inn = call.get("inner", [])
-    if not isinstance(inn, list): 
-        return None
-    # find first DeclRefExpr with referencedDecl
-    for x in inn:
-        if isinstance(x, dict) and x.get("kind") == "DeclRefExpr":
-            ref = x.get("referencedDecl", {})
-            if isinstance(ref, dict):
-                n = ref.get("name")
-                if isinstance(n, str):
-                    return n
-    # sometimes callee is a MemberExpr (obj->method). For now skip.
-    return None
-
-def callee_args_from_call(call: Dict[str, Any]) -> List[str]:
-    # We want callee parameter *names* for caller->callee flow label,
-    # but we may not have the declaration here. So we fallback to argument tokens.
-    # Later we will use the callee FunctionDecl's param names if available.
-    args = []
-    inn = call.get("inner", [])
-    if not isinstance(inn, list):
-        return args
-    # In clang json, first inner is callee, following inners are args
-    for x in inn[1:]:
-        if not isinstance(x, dict): 
-            continue
-        # try to capture identifiers/literals
-        k = x.get("kind")
-        if k == "DeclRefExpr":
-            nm = x.get("name") or (x.get("referencedDecl", {}) or {}).get("name")
-            if isinstance(nm, str):
-                args.append(nm)
-        elif k in ("IntegerLiteral", "FloatingLiteral", "StringLiteral", "CharacterLiteral"):
-            val = x.get("value")
-            if val is None:
-                val = k
-            args.append(str(val))
-        else:
-            # fallback: kind name
-            args.append(k)
-    return args
-
-def function_params(fn: Dict[str, Any]) -> List[str]:
-    params = []
-    for n in fn.get("inner", []) or []:
-        if isinstance(n, dict) and n.get("kind") == "ParmVarDecl":
-            nm = n.get("name")
-            if isinstance(nm, str):
-                params.append(nm)
-    return params
-
-def function_return_tokens(fn: Dict[str, Any]) -> List[str]:
-    # Find ReturnStmt and capture simple return expr identifiers/literals; otherwise "function return(void)" if no return.
-    returns = []
-    has_return_stmt = False
-    for n in walk(fn):
+def extract_expr_token(expr: Any) -> str:
+    """
+    반환값/인자 표현을 매우 보수적으로 단순화:
+    - DeclRefExpr: 변수명
+    - IntegerLiteral/FloatingLiteral/StringLiteral: 리터럴 값(가능하면 value)
+    - UnaryOperator/BinaryOperator 등: 내부에서 첫 토큰만 잡거나, repr 대체
+    """
+    if not isinstance(expr, (dict, list)):
+        return ""
+    # walk shallowly
+    for n in walk(expr):
         if not isinstance(n, dict):
             continue
-        if n.get("kind") == "ReturnStmt":
-            has_return_stmt = True
-            inn = n.get("inner", [])
-            if isinstance(inn, list) and inn:
-                x = inn[0]
-                if isinstance(x, dict):
-                    k = x.get("kind")
-                    if k == "DeclRefExpr":
-                        nm = x.get("name") or (x.get("referencedDecl", {}) or {}).get("name")
-                        returns.append(str(nm) if nm else "return")
-                    elif k in ("IntegerLiteral","FloatingLiteral","StringLiteral","CharacterLiteral"):
-                        returns.append(str(x.get("value", k)))
-                    else:
-                        returns.append(k)
-            else:
-                # return;
-                returns.append("function return(void)")
-    if not has_return_stmt:
-        # likely void or no explicit return
-        returns.append("function return(void)")
-    return returns[:1]  # keep one representative token
+        k = n.get("kind")
+        if k == "DeclRefExpr":
+            nm = n.get("referencedDecl", {}).get("name") or n.get("name")
+            if nm: return nm
+        if k in ("IntegerLiteral", "FloatingLiteral"):
+            v = n.get("value")
+            if v is not None: return str(v)
+        if k == "StringLiteral":
+            # avoid huge strings
+            v = n.get("value")
+            if v is not None:
+                s = str(v)
+                if len(s) > 32: s = s[:32] + "…"
+                return f"\\\"{s}\\\""
+    # fallback: nothing found
+    return ""
 
-class FuncIndex:
-    def __init__(self):
-        # name -> list of defs (overloads are rare in C; but static funcs with same name could exist)
-        self.defs: Dict[str, List[Dict[str, Any]]] = {}
-        self.meta: Dict[str, Dict[str, Any]] = {}  # func_uid -> {name,file,is_def}
-    def add(self, fn: Dict[str, Any], origin_file: str):
-        name = fn.get("name")
-        if not isinstance(name, str): 
-            return
-        uid = stable_id(origin_file, name, str(fn.get("id","")))
-        self.meta[uid] = {"name": name, "file": origin_file, "is_def": is_function_definition(fn)}
-        self.defs.setdefault(name, []).append({"uid": uid, "node": fn, "file": origin_file})
-
-    def get_best_def(self, name: str) -> Optional[Dict[str, Any]]:
-        cands = self.defs.get(name, [])
-        if not cands:
-            return None
-        # prefer definitions under target dirs
-        defs = [c for c in cands if self.meta[c["uid"]]["is_def"]]
-        if defs:
-            return defs[0]
-        # else fallback to any decl
-        return cands[0]
-
-def load_all_asts() -> List[Tuple[str, Dict[str, Any]]]:
-    asts = []
-    for p in AST_JSON_DIR.glob("*.ast.json"):
-        try:
-            data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
-            asts.append((str(p), data))
-        except Exception as e:
-            print(f"[WARN] Failed to parse {p}: {e}")
-    return asts
-
-def build_index(asts: List[Tuple[str, Dict[str, Any]]]) -> FuncIndex:
-    idx = FuncIndex()
-    for src, root in asts:
-        # try to find the original file path from the AST (translation unit)
-        # fallback: src filename
-        origin = None
-        for n in walk(root):
-            if isinstance(n, dict) and "loc" in n and isinstance(n["loc"], dict):
-                f = n["loc"].get("file")
-                if isinstance(f, str):
-                    origin = f
-                    break
-        if origin is None:
-            origin = src
-        for fn in extract_functions(root):
-            of = get_loc_file(fn) or origin
-            idx.add(fn, of)
-    return idx
-
-def merge_ast(caller_fn: Dict[str, Any], idx: FuncIndex, visited: Set[str]) -> Dict[str, Any]:
-    # Deep-ish copy via json roundtrip (simple)
-    merged = json.loads(json.dumps(caller_fn))
-
-    calls = extract_calls(merged)
-    for call in calls:
-        callee = callee_name_from_call(call)
-        if not callee:
-            continue
-        key = f"{merged.get('name','?')}->{callee}"
-        if key in visited:
-            continue
-        visited.add(key)
-
-        cand = idx.get_best_def(callee)
-        if not cand:
-            # current version constraint: cannot resolve -> skip
-            continue
-
-        callee_node = cand["node"]
-        callee_file = cand["file"]
-
-        # Only merge if callee appears to be within our target dirs (best-effort)
-        if isinstance(callee_file, str) and (SRC_DIR in callee_file or INC_DIR in callee_file or is_under_dirs(callee_file)):
-            # recurse
-            callee_merged = merge_ast(callee_node, idx, visited)
-
-            # Attach to call node for traceability
-            call.setdefault("mergedCallee", {})
-            call["mergedCallee"] = {
-                "name": callee,
-                "file": callee_file,
-                "ast": callee_merged
-            }
-        else:
-            # out-of-scope -> skip
-            continue
-
-    return merged
-
-def export_neo4j_ast_graph(merged_funcs: List[Dict[str, Any]]):
-    # Graph model:
-    # - (:ASTNode {id, kind, name, file}) for each node in merged trees
-    # - (parent)-[:HAS_CHILD]->(child)
-    # - (func)-[:CONTAINS]->(node)
-    nodes_csv = NEO4J_AST_DIR / "ast_nodes.csv"
-    rels_csv  = NEO4J_AST_DIR / "ast_rels.csv"
-
-    # headers suitable for neo4j-admin import or LOAD CSV
-    nodes_csv.write_text(":ID,:LABEL,kind,name,file\\n", encoding="utf-8")
-    rels_csv.write_text(":START_ID,:END_ID,:TYPE\\n", encoding="utf-8")
-
-    seen: Set[str] = set()
-
-    def node_id(n: Dict[str, Any]) -> str:
-        kind = str(n.get("kind",""))
-        name = str(n.get("name",""))
-        file = str(get_loc_file(n) or "")
-        # include clang internal id if present for stability
-        cid = str(n.get("id",""))
-        return stable_id(kind, name, file, cid, json.dumps(n.get("range",{}), sort_keys=True))
-
-    def add_node(n: Dict[str, Any], label: str="ASTNode"):
-        nid = node_id(n)
-        if nid in seen:
-            return nid
-        seen.add(nid)
-        kind = str(n.get("kind","")).replace(",", " ")
-        name = str(n.get("name","")).replace(",", " ")
-        file = str(get_loc_file(n) or "").replace(",", " ")
-        nodes_csv.write_text("", encoding="utf-8")  # ensure file exists
-        with nodes_csv.open("a", encoding="utf-8") as f:
-            f.write(f"{nid},{label},{kind},{name},{file}\\n")
-        return nid
-
-    def add_rel(a: str, b: str, typ: str):
-        with rels_csv.open("a", encoding="utf-8") as f:
-            f.write(f"{a},{b},{typ}\\n")
-
-    for mf in merged_funcs:
-        func_label = "Function"
-        fid = add_node(mf, func_label)
-
-        # walk tree and build edges
-        def rec(parent: Optional[Dict[str, Any]], cur: Any):
-            if isinstance(cur, dict):
-                cid = add_node(cur, "ASTNode")
-                if parent is not None:
-                    pid = add_node(parent, "ASTNode")
-                    add_rel(pid, cid, "HAS_CHILD")
-                else:
-                    add_rel(fid, cid, "CONTAINS")
-
-                for k, v in cur.items():
-                    if isinstance(v, (dict, list)):
-                        rec(cur, v)
-            elif isinstance(cur, list):
-                for it in cur:
-                    rec(parent, it)
-
-        rec(None, mf)
-
-    print(f"[OK] Neo4J AST CSV: {nodes_csv}, {rels_csv}")
-
-def export_neo4j_dfd(merged_funcs: List[Dict[str, Any]], idx: FuncIndex):
-    # DFD model:
-    # - (:Function {id, name, file})
-    # - (:Function)-[:CALL {flow}]->(:Function)
-    # - (:Function)-[:RETURN {flow}]->(:Function)
-    #
-    # flow naming rules per your spec:
-    # - caller -> callee flow name: callee parameter names (if available); else fallback to call arg tokens
-    # - callee -> caller flow name: return value token; if none -> "function return(void)"
-    nodes_csv = NEO4J_DFD_DIR / "dfd_nodes.csv"
-    rels_csv  = NEO4J_DFD_DIR / "dfd_rels.csv"
-    nodes_csv.write_text(":ID,:LABEL,name,file\\n", encoding="utf-8")
-    rels_csv.write_text(":START_ID,:END_ID,:TYPE,flow\\n", encoding="utf-8")
-
-    func_ids: Dict[str, str] = {}  # name->id (best-effort)
-
-    def upsert_func(fn: Dict[str, Any]) -> str:
-        name = str(fn.get("name",""))
-        file = str(get_loc_file(fn) or "")
-        fid = stable_id("func", name, file)
-        key = f"{name}@@{file}"
-        if key in func_ids:
-            return func_ids[key]
-        func_ids[key] = fid
-        with nodes_csv.open("a", encoding="utf-8") as f:
-            f.write(f"{fid},Function,{name.replace(',', ' ')},{file.replace(',', ' ')}\\n")
-        return fid
-
-    def add_rel(a: str, b: str, typ: str, flow: str):
-        flow = (flow or "").replace(",", " ")
-        with rels_csv.open("a", encoding="utf-8") as f:
-            f.write(f"{a},{b},{typ},{flow}\\n")
-
-    # Build DFD edges from merged AST call sites
-    for caller in merged_funcs:
-        caller_id = upsert_func(caller)
-        caller_name = str(caller.get("name",""))
-
-        for call in extract_calls(caller):
-            callee = callee_name_from_call(call)
+def build_call_graph(all_funcs: Dict[str, Dict[str, Any]]) -> List[Tuple[str,str,List[str]]]:
+    edges = []
+    for caller, info in all_funcs.items():
+        for c in info.get("calls", []):
+            callee = c.get("callee")
             if not callee:
                 continue
+            edges.append((caller, callee, c.get("args", [])))
+    return edges
 
-            cand = idx.get_best_def(callee)
-            if not cand:
-                # unresolved -> skip
+def merge_ast_by_inlining(funcs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    '병합된 AST'를 실제 AST 노드 트리로 재구성하는 대신,
+    Neo4j에서 시각화하기 쉬운 '함수-호출 트리(inlined)' 형태 JSON으로 산출.
+    - 규칙: caller->callee 관계에서 callee가 funcs에 존재할 때만 inline, 아니면 skip
+    - 순환 호출은 depth 제한으로 방지
+    """
+    MAX_DEPTH = 6
+
+    def inline(fn: str, depth: int, path: Set[str]) -> Dict[str, Any]:
+        base = funcs.get(fn, {"name": fn, "params": [], "returns": [], "calls": [], "has_body": False})
+        node = {
+            "name": fn,
+            "params": base.get("params", []),
+            "returns": base.get("returns", []),
+            "has_body": base.get("has_body", False),
+            "inlined_calls": []
+        }
+        if depth >= MAX_DEPTH:
+            return node
+        path2 = set(path)
+        path2.add(fn)
+
+        for call in base.get("calls", []):
+            callee = call.get("callee")
+            if not callee:
                 continue
-
-            callee_node = cand["node"]
-            callee_file = cand["file"]
-            # enforce current constraint: only merge/dfd edges for in-scope targets
-            if not (isinstance(callee_file, str) and (SRC_DIR in callee_file or INC_DIR in callee_file or is_under_dirs(callee_file))):
+            if callee in path2:
+                node["inlined_calls"].append({"callee": callee, "skipped": True, "reason": "cycle"})
                 continue
+            if callee not in funcs:
+                node["inlined_calls"].append({"callee": callee, "skipped": True, "reason": "out_of_scope"})
+                continue
+            child = inline(callee, depth+1, path2)
+            child["_callsite_args"] = call.get("args", [])
+            node["inlined_calls"].append(child)
+        return node
 
-            callee_id = upsert_func(callee_node)
+    merged = {}
+    for fn in sorted(funcs.keys()):
+        merged[fn] = inline(fn, 0, set())
+    return merged
 
-            # caller -> callee: use callee param names if possible
-            params = function_params(callee_node)
-            if params:
-                flow_call = " ".join(params)
-            else:
-                flow_call = " ".join(callee_args_from_call(call))
-            if not flow_call.strip():
-                flow_call = "(no-params)"
-            add_rel(caller_id, callee_id, "CALL", flow_call)
+def write_csv(nodes: List[Dict[str, Any]], rels: List[Dict[str, Any]], nodes_path: Path, rels_path: Path):
+    # Neo4j-admin import 친화적으로 header 포함
+    # node: :ID(Function),name,params,has_body
+    # rel: :START_ID(Function),:END_ID(Function),:TYPE,label
+    import csv
+    nodes_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # callee -> caller: return token
-            ret_tokens = function_return_tokens(callee_node)
-            flow_ret = ret_tokens[0] if ret_tokens else "function return(void)"
-            add_rel(callee_id, caller_id, "RETURN", flow_ret)
+    with nodes_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([":ID(Function)", "name", "params", "has_body"])
+        for n in nodes:
+            w.writerow([n["id"], n["name"], n.get("params",""), n.get("has_body", False)])
 
-    print(f"[OK] Neo4J DFD CSV: {nodes_csv}, {rels_csv}")
+    with rels_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([":START_ID(Function)", ":END_ID(Function)", ":TYPE", "label"])
+        for r in rels:
+            w.writerow([r["start"], r["end"], r["type"], r.get("label","")])
 
 def main():
-    asts = load_all_asts()
-    if not asts:
-        print("[ERROR] No AST JSON files found. Run gen_ast_json stage first.")
-        return
+    out = Path(OUT_DIR)
+    manifest = load_json(out/"ast_manifest.json")
+    repo_root = Path(manifest["repo_root"])
+    targets = manifest["targets"]
 
-    idx = build_index(asts)
+    # 파일별 AST에서 함수 정보 수집
+    all_funcs: Dict[str, Dict[str, Any]] = {}
 
-    # Choose "root functions" = all function definitions found in-scope,
-    # then merge each one (caller-expansion).
-    merged_funcs = []
-    for name, cands in idx.defs.items():
-        # pick best definition as a root if it is a definition and in-scope
-        best = idx.get_best_def(name)
-        if not best:
+    for t in targets:
+        ast_path = repo_root / t["ast_json"]
+        try:
+            ast = load_json(ast_path)
+        except Exception:
             continue
-        fn = best["node"]
-        file = best["file"]
-        if not is_function_definition(fn):
+        funcs = extract_functions(ast)
+
+        # 동일 이름 함수가 여러 TU에 나올 수 있음.
+        # 여기서는 "body가 있는 쪽"을 우선(보수적으로) 채택
+        for name, info in funcs.items():
+            if name not in all_funcs:
+                all_funcs[name] = info
+            else:
+                # prefer has_body True
+                if (not all_funcs[name].get("has_body")) and info.get("has_body"):
+                    all_funcs[name] = info
+
+    # 2) AST 병합 (inlined JSON)
+    merged = merge_ast_by_inlining(all_funcs)
+    (out/"merged"/"merged_ast.json").write_text(json.dumps(merged, indent=2), encoding="utf-8")
+
+    # 3) Neo4j import 형태(함수 노드/호출 엣지)
+    # Node IDs
+    fn_id = {name: f"F_{i}" for i, name in enumerate(sorted(all_funcs.keys()), start=1)}
+
+    nodes = []
+    for name in sorted(all_funcs.keys()):
+        info = all_funcs[name]
+        nodes.append({
+            "id": fn_id[name],
+            "name": name,
+            "params": ",".join(info.get("params", [])),
+            "has_body": info.get("has_body", False)
+        })
+
+    # 4) DFD 생성 규칙 반영
+    # - caller -> callee : callee의 파라미터명들(파라미터 명만)
+    # - callee -> caller : 반환값(상수/변수명) / 없으면 "function return(void)"
+    rels = []
+    call_edges = build_call_graph(all_funcs)
+
+    for caller, callee, _args in call_edges:
+        if caller not in fn_id or callee not in fn_id:
             continue
-        if not (isinstance(file, str) and (SRC_DIR in file or INC_DIR in file or is_under_dirs(file))):
-            continue
 
-        visited = set()
-        mf = merge_ast(fn, idx, visited)
-        merged_funcs.append(mf)
+        callee_params = all_funcs.get(callee, {}).get("params", [])
+        label_fwd = ",".join(callee_params) if callee_params else ""
+        rels.append({"start": fn_id[caller], "end": fn_id[callee], "type": "CALLS", "label": label_fwd})
 
-    # Export Neo4J formats
-    export_neo4j_ast_graph(merged_funcs)
-    export_neo4j_dfd(merged_funcs, idx)
+        rets = all_funcs.get(callee, {}).get("returns", [])
+        if rets:
+            label_back = "|".join(rets)
+        else:
+            label_back = "function return(void)"
+        rels.append({"start": fn_id[callee], "end": fn_id[caller], "type": "RETURNS", "label": label_back})
 
-    # Also store merged AST json (optional, but useful)
-    merged_out = Path(OUT_DIR) / "merged_ast.json"
-    merged_out.write_text(json.dumps(merged_funcs, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[OK] merged AST JSON saved: {merged_out}")
+    write_csv(
+        nodes,
+        rels,
+        out/"neo4j"/"functions.nodes.csv",
+        out/"neo4j"/"functions.rels.csv"
+    )
+
+    # 5) DFD JSON도 별도 산출(원하면 시각화 툴로도 가능)
+    dfd = {
+        "nodes": [{"id": fn_id[n["name"]], "name": n["name"]} for n in nodes],
+        "edges": rels
+    }
+    (out/"dfd"/"dfd.json").write_text(json.dumps(dfd, indent=2), encoding="utf-8")
+
+    # summary
+    summary = {
+        "function_count": len(nodes),
+        "call_edge_count": sum(1 for r in rels if r["type"] == "CALLS"),
+        "return_edge_count": sum(1 for r in rels if r["type"] == "RETURNS"),
+        "note": "Calls/Returns edges are derived from clang AST dump; out-of-scope callees are skipped in merging."
+    }
+    (out/"summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print("[OK] Built merged_ast.json + Neo4j CSV + DFD")
 
 if __name__ == "__main__":
     main()
 '''
-        sh '''
-          set -eux
-          chmod +x merge_and_export_neo4j.py
-          "${PY}" merge_and_export_neo4j.py
-        '''
+        sh """
+          chmod +x ${OUT_DIR}/extract_ast.py
+          chmod +x ${OUT_DIR}/build_graphs.py
+        """
+      }
+    }
+
+    stage('Generate AST (per file)') {
+      steps {
+        sh """
+          set -euxo pipefail
+          ${PY} ${OUT_DIR}/extract_ast.py
+        """
+      }
+    }
+
+    stage('Merge AST + Build Neo4j/DFD artifacts') {
+      steps {
+        sh """
+          set -euxo pipefail
+          ${PY} ${OUT_DIR}/build_graphs.py
+        """
       }
     }
 
     stage('Archive artifacts') {
       steps {
-        archiveArtifacts artifacts: 'artifacts/**', fingerprint: true
+        archiveArtifacts artifacts: "${OUT_DIR}/**", fingerprint: true
+        sh 'echo "Done."'
       }
     }
   }
 
   post {
     always {
-      sh 'ls -R artifacts || true'
-    }
-    failure {
-      echo "Build failed. Check artifacts/logs/*.clang.log for clang failures."
+      sh 'ls -R ast_out || true'
     }
   }
 }
