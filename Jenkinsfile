@@ -38,16 +38,8 @@ pipeline {
       steps {
         sh '''
           set -eux
-          if sudo -n true 2>/dev/null; then
-            echo "[OK] jenkins 계정이 비밀번호 없이 sudo 사용 가능"
-          else
-            echo "[ERROR] jenkins 계정이 NOPASSWD sudo 설정이 되어있지 않습니다."
-            echo "예시(서버에서 실행):"
-            echo "  sudo visudo -f /etc/sudoers.d/jenkins-apt"
-            echo "  Defaults:jenkins !requiretty"
-            echo "  jenkins ALL=(root) NOPASSWD: /usr/bin/apt-get, /usr/bin/apt, /usr/bin/dpkg, /usr/bin/true"
-            exit 1
-          fi
+          sudo -n true
+          echo "[OK] jenkins 계정이 비밀번호 없이 sudo 사용 가능"
         '''
       }
     }
@@ -55,272 +47,183 @@ pipeline {
     stage('AST 실행 여부 판단') {
       steps {
         script {
-          sh "mkdir -p '${env.AST_STORE}/baseline'"
+          sh "mkdir -p ${AST_STORE}/baseline"
+          def baselineExists = fileExists("${AST_STORE}/baseline/summary.json")
 
-          def baselineExists = fileExists("${env.AST_STORE}/baseline/summary.json")
-
-          // 관심 경로를 정규식으로 넉넉하게 감시
-          sh "git fetch origin master:refs/remotes/origin/master || true"
+          sh "git fetch origin master:refs/remotes/origin/master"
           def changed = sh(
-            script: """
-              git diff --name-only origin/master..HEAD | \\
-              grep -E '^(os/rt/|os/common/ports/ARMv6-M-RP2/|os/rt/templates/|os/oslib/src/|os/hal/src/)' || true
-            """,
+            script: '''
+              set -e
+              git diff --name-only origin/master..HEAD | grep -E "^(os/rt/|os/common/ports/ARMv6-M-RP2/|os/rt/templates/|os/oslib/src/|os/hal/src/)" || true
+            ''',
             returnStdout: true
           ).trim()
 
           if (!baselineExists) {
-            echo "Baseline AST가 존재하지 않음 → 최초 baseline 생성"
-            env.DO_AST = "1"
             env.AST_MODE = "baseline"
-          } else if (changed == "") {
-            echo "관심 경로 변경 없음 → AST 단계 스킵"
-            env.DO_AST = "0"
-          } else {
-            echo "관심 경로 변경 감지 → incremental AST 수행"
-            env.DO_AST = "1"
+            echo "Baseline AST가 존재하지 않음 → 최초 baseline 생성"
+          } else if (changed) {
             env.AST_MODE = "incremental"
+            echo "변경 감지됨 → incremental AST 생성"
+          } else {
+            env.AST_MODE = "skip"
+            echo "변경 없음 → AST 생성 스킵"
           }
         }
       }
     }
 
     stage('의존성 설치') {
-      when { expression { return env.DO_AST == "1" } }
+      when { expression { env.AST_MODE != "skip" } }
       steps {
         sh '''
           set -eux
           export DEBIAN_FRONTEND=noninteractive
-
-          if command -v clang >/dev/null \
-             && command -v bear  >/dev/null \
-             && command -v jq    >/dev/null \
-             && command -v python3 >/dev/null; then
-            echo "[SKIP] 의존성 이미 설치됨 (clang/bear/jq/python3)"
-            exit 0
-          fi
-
-          sudo -n apt-get update
+          command -v clang || sudo -n apt-get update
           sudo -n apt-get install -y clang bear jq python3
         '''
       }
     }
 
     stage('AST 분석 스크립트 생성') {
-      when { expression { return env.DO_AST == "1" } }
+      when { expression { env.AST_MODE != "skip" } }
       steps {
         sh '''
           set -eux
-          mkdir -p tools/ast_ci
 
-          # ==========================================================
-          # [추가] chlicense.h가 저장소에 없을 수도 있으니(또는 경로가 다를 수 있으니)
-          #        AST 파싱만 통과시키기 위한 더미 헤더를 생성
-          #        (실제 파일이 있으면 아무것도 안 함)
-          # ==========================================================
+          mkdir -p tools/ast_ci
           mkdir -p tools/ast_ci/generated
+
+          # ------------------------------------------------------------
+          # chlicense.h 처리:
+          # 1) repo root에 있으면 OK
+          # 2) os/license/chlicense.h가 있으면 OK(단, include path에 os/license 추가 필요)
+          # 3) 둘 다 없으면 tools/ast_ci/generated/chlicense.h 더미 생성
+          # ------------------------------------------------------------
           if [ ! -f "chlicense.h" ] && [ ! -f "os/license/chlicense.h" ]; then
-            cat > tools/ast_ci/generated/chlicense.h << 'H'
+            echo "[INFO] chlicense.h가 없어 더미 생성: tools/ast_ci/generated/chlicense.h"
+            cat > tools/ast_ci/generated/chlicense.h <<'EOF'
 #ifndef CHLICENSE_H
 #define CHLICENSE_H
-/* AST 파싱용 더미 헤더: 라이선스/배너 정의가 필요한 경우 여기에 최소 정의를 추가 */
+/* Dummy license header for CI AST parsing */
 #endif
-H
-            echo "[INFO] chlicense.h가 트리에 없어서 더미 헤더를 생성했습니다: tools/ast_ci/generated/chlicense.h"
+EOF
           else
             echo "[INFO] chlicense.h가 트리에 존재합니다(더미 생성 생략)."
           fi
 
-          # ==========================================================
-          # AST 참고 경로 설정파일 생성(없을 때만)
-          # - 핵심 수정: chlicense.h 탐색을 위해 os/license 및 generated include 추가
-          # ==========================================================
-          if [ ! -f "${AST_PATHS_CONFIG}" ]; then
-            cat > "${AST_PATHS_CONFIG}" << 'JSON'
+          # ------------------------------------------------------------
+          # AST 경로 설정 파일(사용자 설정):
+          # 이미 있으면 그대로 사용.
+          # ------------------------------------------------------------
+          if [ ! -f tools/ast_ci/ast_paths.json ]; then
+            echo "[INFO] tools/ast_ci/ast_paths.json 생성"
+            cat > tools/ast_ci/ast_paths.json <<'JSON'
 {
-  "tu_roots": [
-    "os/rt/src",
+  "ast_scan_dirs": [
+    "os/rt",
+    "os/common/ports/ARMv6-M-RP2",
+    "os/rt/templates",
     "os/oslib/src",
-    "os/hal/src",
-    "os/common/ports/ARMv6-M-RP2"
-  ],
-  "watched_prefixes": [
-    "os/rt/",
-    "os/common/ports/ARMv6-M-RP2/",
-    "os/rt/templates/",
-    "os/oslib/src/",
-    "os/hal/src/"
-  ],
-  "watched_header_prefixes": [
-    "os/rt/include/",
-    "os/common/ports/ARMv6-M-RP2/",
-    "os/rt/templates/",
-    "os/oslib/include/",
-    "os/hal/include/",
-    "os/license/"
+    "os/hal/src"
   ],
   "fallback_includes": [
-    "-Itools/ast_ci/generated",
-    "-Ios/license",
     "-Ios/rt/include",
     "-Ios/rt/templates",
     "-Ios/common/ports/ARMv6-M-RP2",
-    "-Ios/oslib/include",
-    "-Ios/oslib/src",
-    "-Ios/hal/include",
-    "-Ios/hal/src"
+    "-Ios/license",
+    "-Itools/ast_ci/generated"
   ]
 }
 JSON
-            echo "[INFO] ${AST_PATHS_CONFIG} 가 없어서 기본값으로 생성했습니다. 필요하면 이 파일만 수정하세요."
           else
-            echo "[INFO] ${AST_PATHS_CONFIG} 가 존재하므로 해당 설정을 사용합니다."
+            echo "[INFO] tools/ast_ci/ast_paths.json 가 존재하므로 해당 설정을 사용합니다."
           fi
 
-          # ==========================================================
-          # ast_build_and_diff.py 생성(기존 유지)
-          # ==========================================================
-          cat > tools/ast_ci/ast_build_and_diff.py << 'PY'
+          # ------------------------------------------------------------
+          # AST 생성 + diff 스크립트 (build-cmd 있으면 compile_commands.json 사용)
+          # ------------------------------------------------------------
+          cat > tools/ast_ci/ast_build_and_diff.py <<'PY'
 #!/usr/bin/env python3
-import argparse, json, subprocess, sys, hashlib
+import argparse, json, os, re, shutil, subprocess, sys
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
 
-def run(cmd: List[str], check: bool = True) -> str:
-    p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def run(cmd, check=True, capture=False):
+    if capture:
+        return subprocess.check_output(cmd, text=True)
+    p = subprocess.run(cmd)
     if check and p.returncode != 0:
-        sys.stderr.write(p.stderr)
         raise SystemExit(p.returncode)
-    return p.stdout
+    return p.returncode
 
-def run_shell(cmd: str) -> str:
-    p = subprocess.run(["bash","-lc",cmd], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return (p.stdout or "") + (p.stderr or "")
+def git_show(ref, path):
+    return run(["git", "show", f"{ref}:{path}"], capture=True)
 
-def sha1_text(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
-
-def git_rev(ref: str) -> str:
-    return run(["git","rev-parse",ref]).strip()
-
-def ensure_parent(p: Path) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-def list_changed_files(base: str, head: str) -> List[str]:
-    out = run(["git","diff","--name-only",f"{base}..{head}"])
-    return [x for x in out.splitlines() if x]
-
-def load_config(path: str) -> Dict[str, Any]:
-    p = Path(path)
-    if not p.exists():
+def read_cfg(cfg_path: Path):
+    if not cfg_path.exists():
         return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8", errors="ignore"))
-    except Exception:
-        return {}
+    return json.loads(cfg_path.read_text())
 
-def build_compile_db(build_cmd: str) -> bool:
-    if not build_cmd.strip():
-        return False
-    _ = run_shell(f"bear -- {build_cmd}")
-    return Path("compile_commands.json").exists()
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
-def read_compile_db() -> Dict[str, List[str]]:
-    db = Path("compile_commands.json")
-    if not db.exists():
-        return {}
-    data = json.loads(db.read_text(encoding="utf-8", errors="ignore"))
-    mapping: Dict[str, List[str]] = {}
-    for e in data:
-        fp = e.get("file")
-        if not fp:
+def write_text(p: Path, s: str):
+    ensure_dir(p.parent)
+    p.write_text(s)
+
+def collect_tus(scan_dirs):
+    tus = []
+    for d in scan_dirs:
+        root = Path(d)
+        if not root.exists():
             continue
-        absf = str(Path(fp).resolve())
-        args = e.get("arguments") or e.get("command","").split()
-        if args and (args[0].endswith("clang") or args[0].endswith("gcc") or args[0].endswith("cc")):
-            args = args[1:]
-        mapping[absf] = args
-    return mapping
-
-def filter_args(args: List[str]) -> List[str]:
-    skip = {"-c","-MMD","-MP"}
-    out: List[str] = []
-    i=0
-    while i < len(args):
-        a=args[i]
-        if a in skip:
-            i+=1
-        elif a in ("-o","-MF","-MT","-MQ"):
-            i+=2
-        elif a.endswith(".c"):
-            i+=1
-        else:
-            out.append(a); i+=1
-    return out
-
-def clang_ast(clang: str, src: str, flags: List[str]) -> Dict[str, Any]:
-    cmd = [clang,"-Xclang","-ast-dump=json","-fsyntax-only",src] + flags
-    return json.loads(run(cmd))
-
-def normalise(node: Any) -> str:
-    if not isinstance(node, dict):
-        return ""
-    s = f"{node.get('kind','')}|{node.get('name','')}"
-    for c in node.get("inner", []) or []:
-        s += normalise(c)
-    return s
-
-def index_functions(ast: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    def walk(n: Any):
-        if isinstance(n, dict):
-            if n.get("kind")=="FunctionDecl" and n.get("name"):
-                out[n["name"]] = n
-            for c in n.get("inner", []) or []:
-                walk(c)
-    walk(ast)
-    return out
-
-def diff_functions(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, List[str]]:
-    fa = index_functions(a)
-    fb = index_functions(b)
-    return {
-        "only_before": sorted(set(fa) - set(fb)),
-        "only_after":  sorted(set(fb) - set(fa)),
-        "changed": sorted(
-            f for f in (fa.keys() & fb.keys())
-            if sha1_text(normalise(fa[f])) != sha1_text(normalise(fb[f]))
-        )
-    }
-
-def list_all_tus(root: Path, tu_roots: List[str]) -> List[Path]:
-    tus: List[Path] = []
-    for r in tu_roots:
-        tus.extend((root / r).rglob("*.c"))
+        for c in root.rglob("*.c"):
+            tus.append(c)
     return sorted(set(tus))
 
-def select_incremental_tus(
-    changed: List[str],
-    root: Path,
-    tu_roots: List[str],
-    watched_prefixes: Tuple[str, ...],
-    watched_header_prefixes: Tuple[str, ...],
-) -> List[Path]:
-    tus: Set[Path] = set()
+def build_compile_db(build_cmd: str, outdir: Path):
+    if not build_cmd.strip():
+        return None
+    # bear 로 compile_commands.json 생성
+    run(["bash","-lc", f"bear -- {build_cmd}"], check=True)
+    db = Path("compile_commands.json")
+    if not db.exists():
+        return None
+    shutil.copy(db, outdir / "compile_commands.json")
+    return outdir / "compile_commands.json"
 
-    for p in changed:
-        for tu_root in tu_roots:
-            prefix = tu_root.rstrip("/") + "/"
-            if p.startswith(prefix) and p.endswith(".c"):
-                tus.add(root / p)
+def load_compile_db(db_path: Path):
+    db = json.loads(db_path.read_text())
+    # file -> (directory, arguments/command)
+    m = {}
+    for ent in db:
+        f = ent.get("file")
+        d = ent.get("directory", ".")
+        args = ent.get("arguments")
+        cmd = ent.get("command")
+        if args:
+            m[f] = (d, args)
+        elif cmd:
+            m[f] = (d, ["bash","-lc", cmd])
+    return m
 
-    header_changed = any(p.startswith(watched_header_prefixes) and p.endswith(".h") for p in changed)
-    dep_changed = any(p.startswith(watched_prefixes) for p in changed)
+def clang_ast(src: Path, out_json: Path, incs, clang="clang"):
+    ensure_dir(out_json.parent)
+    cmd = [clang, "-Xclang", "-ast-dump=json", "-fsyntax-only"] + incs + [str(src)]
+    # stderr는 CI 로그에 보이도록 그대로 둔다
+    with open(out_json, "w") as f:
+        subprocess.run(cmd, stdout=f, check=True)
 
-    if header_changed or dep_changed:
-        tus |= set(list_all_tus(root, tu_roots))
-
-    return sorted(tus)
+def diff_json(a: Path, b: Path, out_path: Path):
+    # 단순 diff: json pretty + unified diff 저장
+    import difflib
+    ja = json.loads(a.read_text())
+    jb = json.loads(b.read_text())
+    sa = json.dumps(ja, indent=2, sort_keys=True).splitlines(keepends=True)
+    sb = json.dumps(jb, indent=2, sort_keys=True).splitlines(keepends=True)
+    diff = difflib.unified_diff(sa, sb, fromfile=str(a), tofile=str(b))
+    ensure_dir(out_path.parent)
+    out_path.write_text("".join(diff))
 
 def main():
     ap = argparse.ArgumentParser()
@@ -328,242 +231,194 @@ def main():
     ap.add_argument("--base", required=True)
     ap.add_argument("--head", required=True)
     ap.add_argument("--mode", choices=["baseline","incremental"], required=True)
-    ap.add_argument("--clang", default="clang")
     ap.add_argument("--build-cmd", default="")
     ap.add_argument("--config", default="tools/ast_ci/ast_paths.json")
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
+    outdir = Path(args.outdir)
+    ensure_dir(outdir)
 
-    tu_roots = cfg.get("tu_roots") or ["os/rt/src"]
-    watched_prefixes = tuple(cfg.get("watched_prefixes") or ["os/rt/"])
-    watched_header_prefixes = tuple(cfg.get("watched_header_prefixes") or ["os/rt/include/"])
+    cfg = read_cfg(Path(args.config))
+    scan_dirs = cfg.get("ast_scan_dirs") or ["os/rt"]
+
+    # 사용자 config가 불완전하더라도 필수 include는 강제로 보강
     fallback_includes = cfg.get("fallback_includes") or ["-Ios/rt/include"]
 
-    root = Path(".").resolve()
-    out = Path(args.outdir); out.mkdir(parents=True, exist_ok=True)
+    # Ensure essential include paths exist even when user config is incomplete.
+    mandatory_includes = [
+        "-I.",
+        "-Itools/ast_ci/generated",
+        "-Ios/license",
+        "-Ios/rt/include",
+        "-Ios/rt/templates",
+        "-Ios/common/ports/ARMv6-M-RP2",
+    ]
+    for inc in mandatory_includes:
+        if inc not in fallback_includes:
+            fallback_includes.append(inc)
 
-    base_commit = git_rev(args.base)
-    head_commit = git_rev(args.head)
+    # compile db (있으면 우선)
+    db_path = build_compile_db(args.build_cmd, outdir)
+    compile_db = load_compile_db(db_path) if db_path else {}
 
-    compile_db: Dict[str, List[str]] = {}
-    if args.build_cmd and build_compile_db(args.build_cmd):
-        compile_db = read_compile_db()
-
-    if args.mode == "baseline":
-        tus = list_all_tus(root, tu_roots)
-        changed_files = ["(baseline 초기 생성)"]
-    else:
-        changed_files = list_changed_files(args.base, args.head)
-        tus = select_incremental_tus(
-            changed_files, root,
-            tu_roots=tu_roots,
-            watched_prefixes=watched_prefixes,
-            watched_header_prefixes=watched_header_prefixes,
-        )
-
-    results = []
-    for tu in tus:
-        rel = tu.relative_to(root)
-
-        before_c = out / f"{rel}.before.c"
-        after_c  = out / f"{rel}.after.c"
-
-        before_ast = out / f"{rel}.before.ast.json"
-        after_ast  = out / f"{rel}.after.ast.json"
-
-        diffp  = out / f"{rel}.diff.json"
-
-        ensure_parent(before_c); ensure_parent(after_c)
-        ensure_parent(before_ast); ensure_parent(after_ast)
-        ensure_parent(diffp)
-
-        before_c.write_text(run(["git","show",f"{base_commit}:{rel}"], check=False), encoding="utf-8", errors="ignore")
-        after_c.write_text(run(["git","show",f"{head_commit}:{rel}"], check=False), encoding="utf-8", errors="ignore")
-
-        flags = compile_db.get(str(tu.resolve()), fallback_includes)
-        flags = filter_args(flags)
-
-        ast_b = clang_ast(args.clang, str(before_c), flags)
-        ast_a = clang_ast(args.clang, str(after_c),  flags)
-
-        before_ast.write_text(json.dumps(ast_b, indent=2), encoding="utf-8")
-        after_ast.write_text(json.dumps(ast_a, indent=2), encoding="utf-8")
-
-        diff = diff_functions(ast_b, ast_a)
-        diffp.write_text(json.dumps(diff, indent=2), encoding="utf-8")
-
-        results.append({"tu": str(rel), **diff})
+    tus = collect_tus(scan_dirs)
 
     summary = {
         "mode": args.mode,
-        "base_commit": base_commit,
-        "head_commit": head_commit,
-        "config": args.config,
-        "tu_roots": tu_roots,
-        "watched_prefixes": list(watched_prefixes),
-        "watched_header_prefixes": list(watched_header_prefixes),
-        "fallback_includes": fallback_includes,
-        "changed_files": changed_files,
-        "results": results
+        "base": args.base,
+        "head": args.head,
+        "tu_count": len(tus),
+        "head_commit": run(["git","rev-parse", args.head], capture=True).strip(),
     }
-    (out/"summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    # baseline: 전체 TU 생성
+    # incremental: 변경된 TU만 생성(단순히 git diff로 잡힘)
+    changed = set()
+    if args.mode == "incremental":
+        names = run(["bash","-lc", f"git diff --name-only {args.base}..{args.head}"], capture=True).splitlines()
+        for n in names:
+            if n.endswith(".c"):
+                changed.add(Path(n))
+    else:
+        changed = set(tus)
+
+    for tu in tus:
+        if tu not in changed:
+            continue
+
+        base_src = outdir / f"{tu}.before.c"
+        head_src = outdir / f"{tu}.after.c"
+
+        # 파일 내용 스냅샷
+        try:
+            write_text(base_src, git_show(args.base, str(tu)))
+        except subprocess.CalledProcessError:
+            continue
+        try:
+            write_text(head_src, git_show(args.head, str(tu)))
+        except subprocess.CalledProcessError:
+            continue
+
+        # include 결정: compile_commands가 있으면 거기서 -I/-D만 추출
+        def incs_for(src_path: Path):
+            key = str(tu)
+            incs = []
+            # compile_db 키는 absolute/relative 혼재 가능 → 부분 매칭
+            ent = None
+            if key in compile_db:
+                ent = compile_db[key]
+            else:
+                for k,v in compile_db.items():
+                    if k.endswith(key):
+                        ent = v; break
+
+            if ent:
+                d, argv = ent
+                # argv에서 -I/-D만 추출
+                if isinstance(argv, list) and argv[:2] != ["bash","-lc"]:
+                    for a in argv:
+                        if a.startswith("-I") or a.startswith("-D"):
+                            incs.append(a)
+                else:
+                    # command string 케이스는 fallback
+                    incs = list(fallback_includes)
+            else:
+                incs = list(fallback_includes)
+            return incs
+
+        before_ast = outdir / f"{tu}.before.ast.json"
+        after_ast  = outdir / f"{tu}.after.ast.json"
+
+        clang_ast(base_src, before_ast, incs_for(base_src), clang=os.environ.get("CLANG","clang"))
+        clang_ast(head_src, after_ast,  incs_for(head_src), clang=os.environ.get("CLANG","clang"))
+
+        diff_path = outdir / f"{tu}.ast.diff.txt"
+        diff_json(before_ast, after_ast, diff_path)
+
+    (outdir / "summary.json").write_text(json.dumps(summary, indent=2))
 
 if __name__ == "__main__":
     main()
 PY
           chmod +x tools/ast_ci/ast_build_and_diff.py
 
-          # ==========================================================
-          # merged AST 생성기(ast_merge.py) 생성(기존 유지)
-          # ==========================================================
-          cat > tools/ast_ci/ast_merge.py << 'PY'
+          # ------------------------------------------------------------
+          # merged AST 생성 스크립트 (확장 AST)
+          # ------------------------------------------------------------
+          cat > tools/ast_ci/ast_merge.py <<'PY'
 #!/usr/bin/env python3
-import argparse
-import json
+import argparse, json
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
 
-def load_json(p: Path) -> Any:
-    return json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+def load(p: Path):
+    return json.loads(p.read_text())
 
-def save_json(p: Path, obj: Any) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+def save(p: Path, obj):
+    p.write_text(json.dumps(obj, indent=2))
 
-def walk(node: Any):
-    if isinstance(node, dict):
-        yield node
-        for c in node.get("inner", []) or []:
-            yield from walk(c)
-    elif isinstance(node, list):
-        for x in node:
-            yield from walk(x)
-
-def has_body(func_decl: Dict[str, Any]) -> bool:
-    for c in func_decl.get("inner", []) or []:
-        if isinstance(c, dict) and c.get("kind") == "CompoundStmt":
-            return True
-    kinds = [x.get("kind") for x in func_decl.get("inner", []) or [] if isinstance(x, dict)]
-    return "CompoundStmt" in kinds
-
-def index_functions(ast: Dict[str, Any], tu_rel: str) -> Dict[str, Tuple[str, Dict[str, Any]]]:
-    idx: Dict[str, Tuple[str, Dict[str, Any]]] = {}
-    for n in walk(ast):
-        if isinstance(n, dict) and n.get("kind") == "FunctionDecl" and n.get("name"):
-            name = n["name"]
-            if name not in idx:
-                idx[name] = (tu_rel, n)
-            else:
-                _, old = idx[name]
-                if (not has_body(old)) and has_body(n):
-                    idx[name] = (tu_rel, n)
+def index_functions(ast_obj):
+    # 간단 인덱싱: FunctionDecl 이름 -> node
+    idx = {}
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("kind") == "FunctionDecl":
+            name = node.get("name")
+            if name:
+                idx[name] = node
+        for k,v in node.items():
+            if isinstance(v, dict):
+                walk(v)
+            elif isinstance(v, list):
+                for it in v:
+                    if isinstance(it, dict):
+                        walk(it)
+    walk(ast_obj)
     return idx
 
-def extract_callee_names(call_expr: Dict[str, Any]) -> List[str]:
-    names: List[str] = []
-    for n in walk(call_expr):
-        if not isinstance(n, dict):
-            continue
-        if n.get("kind") == "DeclRefExpr":
-            nm = n.get("name")
-            if nm:
-                names.append(nm)
-            ref = n.get("referencedDecl")
-            if isinstance(ref, dict) and ref.get("name"):
-                names.append(ref["name"])
+def find_callees(ast_obj):
+    callees = set()
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("kind") == "CallExpr":
+            # clang json에서 directCallee 또는 referencedDecl 등에 이름이 있을 수 있음
+            for key in ("directCallee", "referencedDecl", "callee", "name"):
+                v = node.get(key)
+                if isinstance(v, dict) and "name" in v:
+                    callees.add(v["name"])
+                elif isinstance(v, str) and key == "name":
+                    # name이 함수명인 케이스는 보수적으로 제외
+                    pass
+        for k,v in node.items():
+            if isinstance(v, dict):
+                walk(v)
+            elif isinstance(v, list):
+                for it in v:
+                    if isinstance(it, dict):
+                        walk(it)
+    walk(ast_obj)
+    return sorted(callees)
 
-    seen = set()
-    out = []
-    for x in names:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+def merge_one(root_ast, all_func_idx, max_depth=3):
+    merged = json.loads(json.dumps(root_ast))
+    visited = set()
 
-def build_merged_function(
-    func_decl: Dict[str, Any],
-    func_idx: Dict[str, Tuple[str, Dict[str, Any]]],
-    max_depth: int,
-) -> Dict[str, Any]:
-    merged = json.loads(json.dumps(func_decl))
+    def attach(node, depth):
+        if depth <= 0:
+            return
+        for callee in find_callees(node):
+            if callee in visited:
+                continue
+            if callee in all_func_idx:
+                visited.add(callee)
+                # callee AST를 node에 붙임
+                node.setdefault("mergedCallees", [])
+                node["mergedCallees"].append(all_func_idx[callee])
+                attach(all_func_idx[callee], depth-1)
 
-    visited: Set[str] = set()
-    stack: List[Tuple[str, int]] = []
-
-    def enqueue_from(node: Dict[str, Any], depth: int):
-        for n in walk(node):
-            if isinstance(n, dict) and n.get("kind") == "CallExpr":
-                for callee in extract_callee_names(n):
-                    stack.append((callee, depth))
-
-    enqueue_from(func_decl, 1)
-
-    merged_callees: List[Dict[str, Any]] = []
-
-    while stack:
-        callee, depth = stack.pop()
-        if depth > max_depth:
-            continue
-        if callee in visited:
-            continue
-        visited.add(callee)
-
-        if callee not in func_idx:
-            continue
-
-        callee_tu, callee_decl = func_idx[callee]
-        callee_copy = json.loads(json.dumps(callee_decl))
-
-        merged_callees.append({
-            "name": callee,
-            "tu": callee_tu,
-            "ast": callee_copy
-        })
-
-        enqueue_from(callee_decl, depth + 1)
-
-    merged["__merged_callees__"] = merged_callees
-    merged["__merged_meta__"] = {
-        "max_depth": max_depth,
-        "callee_count": len(merged_callees)
-    }
+    attach(merged, max_depth)
     return merged
-
-def merge_one_side(out_dir: Path, side: str, max_depth: int) -> None:
-    ast_files = sorted(out_dir.rglob(f"*.{side}.ast.json"))
-
-    global_idx: Dict[str, Tuple[str, Dict[str, Any]]] = {}
-    per_file_ast: Dict[Path, Dict[str, Any]] = {}
-
-    for f in ast_files:
-        ast = load_json(f)
-        per_file_ast[f] = ast
-
-        tu_rel = str(f.relative_to(out_dir)).replace(f".{side}.ast.json", "")
-        idx = index_functions(ast, tu_rel)
-        for k, v in idx.items():
-            if k not in global_idx:
-                global_idx[k] = v
-            else:
-                _, old = global_idx[k]
-                _, new = v
-                if (not has_body(old)) and has_body(new):
-                    global_idx[k] = v
-
-    for f, ast in per_file_ast.items():
-        merged_root = json.loads(json.dumps(ast))
-
-        merged_funcs: List[Dict[str, Any]] = []
-        for n in walk(ast):
-            if isinstance(n, dict) and n.get("kind") == "FunctionDecl" and n.get("name"):
-                merged_funcs.append(build_merged_function(n, global_idx, max_depth=max_depth))
-
-        merged_root["__merged_functions__"] = merged_funcs
-        merged_root["__merged_index_size__"] = len(global_idx)
-
-        out_file = f.with_name(f.name.replace(f".{side}.ast.json", f".{side}.merged.ast.json"))
-        save_json(out_file, merged_root)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -571,12 +426,31 @@ def main():
     ap.add_argument("--max-depth", type=int, default=3)
     args = ap.parse_args()
 
-    out_dir = Path(args.dir).resolve()
-    if not out_dir.exists():
-        raise SystemExit(f"[ERROR] out_dir not found: {out_dir}")
+    d = Path(args.dir)
+    ast_files = list(d.rglob("*.ast.json"))
+    # 동일 디렉토리의 ast들을 대상으로 함수 인덱싱
+    all_idx = {}
+    for f in ast_files:
+        try:
+            obj = load(f)
+        except Exception:
+            continue
+        all_idx.update(index_functions(obj))
 
-    merge_one_side(out_dir, "before", args.max_depth)
-    merge_one_side(out_dir, "after", args.max_depth)
+    for f in ast_files:
+        if f.name.endswith(".before.ast.json"):
+            out = f.with_name(f.name.replace(".before.ast.json", ".before.merged.ast.json"))
+        elif f.name.endswith(".after.ast.json"):
+            out = f.with_name(f.name.replace(".after.ast.json", ".after.merged.ast.json"))
+        else:
+            continue
+
+        try:
+            root = load(f)
+            merged = merge_one(root, all_idx, max_depth=args.max_depth)
+            save(out, merged)
+        except Exception:
+            continue
 
 if __name__ == "__main__":
     main()
@@ -586,10 +460,9 @@ PY
       }
     }
 
-    stage('AST 생성 및 diff (롤백 포함)') {
-      when { expression { return env.DO_AST == "1" } }
+    stage('AST 생성 및 diff (롤백 포함))') {
+      when { expression { env.AST_MODE != "skip" } }
       options { timeout(time: 25, unit: 'MINUTES') }
-
       steps {
         sh '''
           bash -lc '
