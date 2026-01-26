@@ -1,348 +1,585 @@
 pipeline {
   agent any
 
+  triggers {
+    githubPush()
+  }
+
   options {
     timestamps()
     ansiColor('xterm')
-    buildDiscarder(logRotator(numToKeepStr: '30'))
-  }
-
-  parameters {
-    string(name: 'REPO_URL', defaultValue: 'https://github.com/sinse100/ChibiOS', description: 'Target repository URL')
-    string(name: 'BRANCH', defaultValue: 'master', description: 'Git branch to build')
-    string(name: 'C_SRC_DIR', defaultValue: 'os/rt/src', description: 'Directory containing .c files')
-    string(name: 'H_INC_DIR', defaultValue: 'os/rt/include', description: 'Directory containing .h files (include path)')
-    string(name: 'EXTRA_INCLUDE_DIRS', defaultValue: '', description: 'Extra include dirs (comma-separated, relative to repo root)')
-    string(name: 'CLANG_BIN', defaultValue: 'clang', description: 'clang executable name/path')
-    string(name: 'PYTHON_BIN', defaultValue: 'python3', description: 'python executable name/path')
+    disableConcurrentBuilds()
   }
 
   environment {
-    OUT_DIR = "out_ast"
-    RAW_AST_DIR = "out_ast/raw_ast"
-    MERGED_AST_DIR = "out_ast/merged_ast"
-    NEO4J_DIR = "out_ast/neo4j"
+    SRC_DIR  = "os/rt/src"
+    INC_DIR  = "os/rt/include"
+    OUT_DIR  = "artifacts"
+    PY       = "python3"
+    CLANG    = "clang"
   }
 
   stages {
     stage('Checkout') {
       steps {
-        deleteDir()
-        checkout([$class: 'GitSCM',
-          branches: [[name: "*/${params.BRANCH}"]],
-          userRemoteConfigs: [[url: params.REPO_URL]]
-        ])
+        checkout scm
+      }
+    }
+
+    stage('Prepare workspace') {
+      steps {
         sh '''
-          set -euxo pipefail
-          git rev-parse --abbrev-ref HEAD
-          git rev-parse HEAD
+          set -eux
+          mkdir -p "${OUT_DIR}"/{ast_json,neo4j_ast,neo4j_dfd,logs}
         '''
       }
     }
 
-    // ✅ 요청 반영: AST 생성 + 병합 + Neo4j import 파일 변환에 필요한 툴을 설치하는 stage를 완전 반영
-    stage('Install toolchain (AST + Neo4j export)') {
+    stage('Generate AST JSON per C file') {
       steps {
+        // Python script that:
+        // - finds .c/.h in SRC_DIR/INC_DIR
+        // - runs clang AST dump json for each .c (and optionally headers if you want)
+        // - outputs JSON files under OUT_DIR/ast_json
+        writeFile file: 'gen_ast_json.py', text: '''
+#!/usr/bin/env python3
+import os, sys, json, subprocess, hashlib
+from pathlib import Path
+
+SRC_DIR = os.environ.get("SRC_DIR", "os/rt/src")
+INC_DIR = os.environ.get("INC_DIR", "os/rt/include")
+OUT_DIR = os.environ.get("OUT_DIR", "artifacts")
+CLANG   = os.environ.get("CLANG", "clang")
+
+AST_OUT = Path(OUT_DIR) / "ast_json"
+LOG_OUT = Path(OUT_DIR) / "logs"
+AST_OUT.mkdir(parents=True, exist_ok=True)
+LOG_OUT.mkdir(parents=True, exist_ok=True)
+
+def sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+def run_clang_ast_dump_json(c_path: Path) -> Path:
+    out_json = AST_OUT / f"{c_path.name}.{sha1(str(c_path))}.ast.json"
+    out_log  = LOG_OUT / f"{c_path.name}.{sha1(str(c_path))}.clang.log"
+
+    # NOTE:
+    # - We intentionally add include paths for both SRC_DIR and INC_DIR.
+    # - If your project needs additional -D or -I, extend EXTRA_ARGS below.
+    extra_args = []
+    cmd = [
+        CLANG,
+        "-Xclang", "-ast-dump=json",
+        "-fsyntax-only",
+        "-I", INC_DIR,
+        "-I", SRC_DIR,
+        *extra_args,
+        str(c_path)
+    ]
+
+    with out_log.open("w", encoding="utf-8") as lf:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=lf)
+    if p.returncode != 0:
+        # If clang fails, we still keep the log and skip that file.
+        return None
+
+    out_json.write_bytes(p.stdout)
+    return out_json
+
+def iter_files(root: Path, exts):
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts:
+            yield p
+
+def main():
+    src_root = Path(SRC_DIR)
+    inc_root = Path(INC_DIR)
+
+    c_files = list(iter_files(src_root, {".c"}))
+    if not c_files:
+      print(f"[WARN] No .c files under {SRC_DIR}", file=sys.stderr)
+
+    ok = 0
+    for c in c_files:
+        j = run_clang_ast_dump_json(c)
+        if j:
+            ok += 1
+            print(f"[OK] AST JSON: {c} -> {j}")
+        else:
+            print(f"[SKIP] clang failed: {c} (see logs)", file=sys.stderr)
+
+    print(f"[DONE] generated {ok}/{len(c_files)} AST json files")
+
+if __name__ == "__main__":
+    main()
+'''
         sh '''
-          set -euxo pipefail
-
-          # 0) Basic
-          sudo apt-get update
-
-          # 1) AST generation toolchain
-          sudo apt-get install -y --no-install-recommends \
-            git \
-            clang llvm \
-            build-essential
-
-          # 2) Transform/export toolchain
-          sudo apt-get install -y --no-install-recommends \
-            python3 python3-pip \
-            jq
-
-          # 3) Python libs used by merge/export script
-          python3 -m pip install --upgrade pip
-          python3 -m pip install networkx
-
-          # 4) Version checks (helps debugging in Jenkins logs)
-          echo "---- Versions ----"
-          clang --version || true
-          python3 --version || true
-          pip --version || true
-          jq --version || true
+          set -eux
+          chmod +x gen_ast_json.py
+          "${PY}" gen_ast_json.py
         '''
       }
     }
 
-    stage('Prepare output dirs & scripts') {
+    stage('Merge ASTs (caller <- callee) & Build DFD') {
       steps {
-        sh '''
-          set -euxo pipefail
-          mkdir -p "${OUT_DIR}" "${RAW_AST_DIR}" "${MERGED_AST_DIR}" "${NEO4J_DIR}" scripts
+        // This script:
+        // - parses clang AST json
+        // - extracts function defs, builds call graph inside (SRC_DIR, INC_DIR)
+        // - merges: expand callee AST nodes into caller merged tree (best-effort)
+        // - skips callees not found within dirs (per your current algorithm constraint)
+        // - produces Neo4J CSV for:
+        //   (a) AST graph representation
+        //   (b) DFD representation (nodes=functions, flows=call/return)
+        writeFile file: 'merge_and_export_neo4j.py', text: '''
+#!/usr/bin/env python3
+import os, json, re, hashlib
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Set, Optional
 
-          # -------- scripts/gen_ast.sh --------
-          cat > scripts/gen_ast.sh << 'EOF'
-          #!/usr/bin/env bash
-          set -euxo pipefail
+SRC_DIR = os.environ.get("SRC_DIR", "os/rt/src")
+INC_DIR = os.environ.get("INC_DIR", "os/rt/include")
+OUT_DIR = os.environ.get("OUT_DIR", "artifacts")
 
-          CLANG_BIN="$1"
-          REPO_ROOT="$2"
-          C_FILE_REL="$3"
-          RAW_AST_DIR="$4"
-          INC_DIR_REL="$5"
-          EXTRA_INCS_CSV="$6"
+AST_JSON_DIR = Path(OUT_DIR) / "ast_json"
+NEO4J_AST_DIR = Path(OUT_DIR) / "neo4j_ast"
+NEO4J_DFD_DIR = Path(OUT_DIR) / "neo4j_dfd"
+NEO4J_AST_DIR.mkdir(parents=True, exist_ok=True)
+NEO4J_DFD_DIR.mkdir(parents=True, exist_ok=True)
 
-          C_FILE_ABS="${REPO_ROOT}/${C_FILE_REL}"
+def sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
-          # Build include flags
-          INC_FLAGS="-I${REPO_ROOT}/${INC_DIR_REL}"
-          if [[ -n "${EXTRA_INCS_CSV}" ]]; then
-            IFS=',' read -ra EXTRA <<< "${EXTRA_INCS_CSV}"
-            for d in "${EXTRA[@]}"; do
-              d_trim="$(echo "$d" | xargs)"
-              [[ -n "$d_trim" ]] && INC_FLAGS="${INC_FLAGS} -I${REPO_ROOT}/${d_trim}"
-            done
-          fi
+def stable_id(*parts: str) -> str:
+    raw = "::".join(parts)
+    return sha1(raw)
 
-          # Output name: path-safe
-          SAFE_NAME="$(echo "${C_FILE_REL}" | sed 's#[/ ]#_#g')"
-          OUT_JSON="${RAW_AST_DIR}/${SAFE_NAME}.ast.json"
+def is_under_dirs(path: str) -> bool:
+    # clang nodes may include absolute paths; we match substrings.
+    return (f"/{SRC_DIR}/" in path) or (f"/{INC_DIR}/" in path) or path.endswith(f"/{SRC_DIR}") or path.endswith(f"/{INC_DIR}")
 
-          # NOTE: You may need additional -D macros depending on ChibiOS config.
-          # Keep it light for syntax-only parsing.
-          "${CLANG_BIN}" -x c -fsyntax-only \
-            ${INC_FLAGS} \
-            -Xclang -ast-dump=json \
-            "${C_FILE_ABS}" > "${OUT_JSON}" || {
-              echo "[WARN] AST dump failed for ${C_FILE_REL} (skipping)."
-              rm -f "${OUT_JSON}"
-              exit 0
+def walk(node: Any):
+    if isinstance(node, dict):
+        yield node
+        for k, v in node.items():
+            if isinstance(v, (dict, list)):
+                yield from walk(v)
+    elif isinstance(node, list):
+        for it in node:
+            yield from walk(it)
+
+def get_loc_file(n: Dict[str, Any]) -> Optional[str]:
+    loc = n.get("loc") or {}
+    file = loc.get("file")
+    if isinstance(file, str):
+        return file
+    return None
+
+def extract_functions(ast_root: Dict[str, Any]) -> List[Dict[str, Any]]:
+    funcs = []
+    for n in walk(ast_root):
+        if not isinstance(n, dict): 
+            continue
+        if n.get("kind") == "FunctionDecl":
+            # In clang AST json, function definitions often have "isImplicit" false and have "inner" etc.
+            # We prefer nodes that appear to be definitions (have body in 'inner' with CompoundStmt)
+            name = n.get("name")
+            if not name:
+                continue
+            funcs.append(n)
+    return funcs
+
+def is_function_definition(fn: Dict[str, Any]) -> bool:
+    # heuristic: has 'inner' containing 'CompoundStmt'
+    inn = fn.get("inner", [])
+    if not isinstance(inn, list): 
+        return False
+    for c in inn:
+        if isinstance(c, dict) and c.get("kind") == "CompoundStmt":
+            return True
+    return False
+
+def extract_calls(fn: Dict[str, Any]) -> List[Dict[str, Any]]:
+    calls = []
+    for n in walk(fn):
+        if not isinstance(n, dict): 
+            continue
+        if n.get("kind") == "CallExpr":
+            calls.append(n)
+    return calls
+
+def callee_name_from_call(call: Dict[str, Any]) -> Optional[str]:
+    # CallExpr typically has 'inner' with 'DeclRefExpr' or 'MemberExpr' etc.
+    inn = call.get("inner", [])
+    if not isinstance(inn, list): 
+        return None
+    # find first DeclRefExpr with referencedDecl
+    for x in inn:
+        if isinstance(x, dict) and x.get("kind") == "DeclRefExpr":
+            ref = x.get("referencedDecl", {})
+            if isinstance(ref, dict):
+                n = ref.get("name")
+                if isinstance(n, str):
+                    return n
+    # sometimes callee is a MemberExpr (obj->method). For now skip.
+    return None
+
+def callee_args_from_call(call: Dict[str, Any]) -> List[str]:
+    # We want callee parameter *names* for caller->callee flow label,
+    # but we may not have the declaration here. So we fallback to argument tokens.
+    # Later we will use the callee FunctionDecl's param names if available.
+    args = []
+    inn = call.get("inner", [])
+    if not isinstance(inn, list):
+        return args
+    # In clang json, first inner is callee, following inners are args
+    for x in inn[1:]:
+        if not isinstance(x, dict): 
+            continue
+        # try to capture identifiers/literals
+        k = x.get("kind")
+        if k == "DeclRefExpr":
+            nm = x.get("name") or (x.get("referencedDecl", {}) or {}).get("name")
+            if isinstance(nm, str):
+                args.append(nm)
+        elif k in ("IntegerLiteral", "FloatingLiteral", "StringLiteral", "CharacterLiteral"):
+            val = x.get("value")
+            if val is None:
+                val = k
+            args.append(str(val))
+        else:
+            # fallback: kind name
+            args.append(k)
+    return args
+
+def function_params(fn: Dict[str, Any]) -> List[str]:
+    params = []
+    for n in fn.get("inner", []) or []:
+        if isinstance(n, dict) and n.get("kind") == "ParmVarDecl":
+            nm = n.get("name")
+            if isinstance(nm, str):
+                params.append(nm)
+    return params
+
+def function_return_tokens(fn: Dict[str, Any]) -> List[str]:
+    # Find ReturnStmt and capture simple return expr identifiers/literals; otherwise "function return(void)" if no return.
+    returns = []
+    has_return_stmt = False
+    for n in walk(fn):
+        if not isinstance(n, dict):
+            continue
+        if n.get("kind") == "ReturnStmt":
+            has_return_stmt = True
+            inn = n.get("inner", [])
+            if isinstance(inn, list) and inn:
+                x = inn[0]
+                if isinstance(x, dict):
+                    k = x.get("kind")
+                    if k == "DeclRefExpr":
+                        nm = x.get("name") or (x.get("referencedDecl", {}) or {}).get("name")
+                        returns.append(str(nm) if nm else "return")
+                    elif k in ("IntegerLiteral","FloatingLiteral","StringLiteral","CharacterLiteral"):
+                        returns.append(str(x.get("value", k)))
+                    else:
+                        returns.append(k)
+            else:
+                # return;
+                returns.append("function return(void)")
+    if not has_return_stmt:
+        # likely void or no explicit return
+        returns.append("function return(void)")
+    return returns[:1]  # keep one representative token
+
+class FuncIndex:
+    def __init__(self):
+        # name -> list of defs (overloads are rare in C; but static funcs with same name could exist)
+        self.defs: Dict[str, List[Dict[str, Any]]] = {}
+        self.meta: Dict[str, Dict[str, Any]] = {}  # func_uid -> {name,file,is_def}
+    def add(self, fn: Dict[str, Any], origin_file: str):
+        name = fn.get("name")
+        if not isinstance(name, str): 
+            return
+        uid = stable_id(origin_file, name, str(fn.get("id","")))
+        self.meta[uid] = {"name": name, "file": origin_file, "is_def": is_function_definition(fn)}
+        self.defs.setdefault(name, []).append({"uid": uid, "node": fn, "file": origin_file})
+
+    def get_best_def(self, name: str) -> Optional[Dict[str, Any]]:
+        cands = self.defs.get(name, [])
+        if not cands:
+            return None
+        # prefer definitions under target dirs
+        defs = [c for c in cands if self.meta[c["uid"]]["is_def"]]
+        if defs:
+            return defs[0]
+        # else fallback to any decl
+        return cands[0]
+
+def load_all_asts() -> List[Tuple[str, Dict[str, Any]]]:
+    asts = []
+    for p in AST_JSON_DIR.glob("*.ast.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+            asts.append((str(p), data))
+        except Exception as e:
+            print(f"[WARN] Failed to parse {p}: {e}")
+    return asts
+
+def build_index(asts: List[Tuple[str, Dict[str, Any]]]) -> FuncIndex:
+    idx = FuncIndex()
+    for src, root in asts:
+        # try to find the original file path from the AST (translation unit)
+        # fallback: src filename
+        origin = None
+        for n in walk(root):
+            if isinstance(n, dict) and "loc" in n and isinstance(n["loc"], dict):
+                f = n["loc"].get("file")
+                if isinstance(f, str):
+                    origin = f
+                    break
+        if origin is None:
+            origin = src
+        for fn in extract_functions(root):
+            of = get_loc_file(fn) or origin
+            idx.add(fn, of)
+    return idx
+
+def merge_ast(caller_fn: Dict[str, Any], idx: FuncIndex, visited: Set[str]) -> Dict[str, Any]:
+    # Deep-ish copy via json roundtrip (simple)
+    merged = json.loads(json.dumps(caller_fn))
+
+    calls = extract_calls(merged)
+    for call in calls:
+        callee = callee_name_from_call(call)
+        if not callee:
+            continue
+        key = f"{merged.get('name','?')}->{callee}"
+        if key in visited:
+            continue
+        visited.add(key)
+
+        cand = idx.get_best_def(callee)
+        if not cand:
+            # current version constraint: cannot resolve -> skip
+            continue
+
+        callee_node = cand["node"]
+        callee_file = cand["file"]
+
+        # Only merge if callee appears to be within our target dirs (best-effort)
+        if isinstance(callee_file, str) and (SRC_DIR in callee_file or INC_DIR in callee_file or is_under_dirs(callee_file)):
+            # recurse
+            callee_merged = merge_ast(callee_node, idx, visited)
+
+            # Attach to call node for traceability
+            call.setdefault("mergedCallee", {})
+            call["mergedCallee"] = {
+                "name": callee,
+                "file": callee_file,
+                "ast": callee_merged
             }
+        else:
+            # out-of-scope -> skip
+            continue
 
-          echo "${OUT_JSON}"
-          EOF
-          chmod +x scripts/gen_ast.sh
+    return merged
 
-          # -------- scripts/merge_and_export.py --------
-          cat > scripts/merge_and_export.py << 'EOF'
-          import argparse
-          import glob
-          import json
-          import os
-          import re
+def export_neo4j_ast_graph(merged_funcs: List[Dict[str, Any]]):
+    # Graph model:
+    # - (:ASTNode {id, kind, name, file}) for each node in merged trees
+    # - (parent)-[:HAS_CHILD]->(child)
+    # - (func)-[:CONTAINS]->(node)
+    nodes_csv = NEO4J_AST_DIR / "ast_nodes.csv"
+    rels_csv  = NEO4J_AST_DIR / "ast_rels.csv"
 
-          def load_json(path):
-            with open(path, 'r', encoding='utf-8') as f:
-              return json.load(f)
+    # headers suitable for neo4j-admin import or LOAD CSV
+    nodes_csv.write_text(":ID,:LABEL,kind,name,file\\n", encoding="utf-8")
+    rels_csv.write_text(":START_ID,:END_ID,:TYPE\\n", encoding="utf-8")
 
-          def iter_nodes(node):
-            if isinstance(node, dict):
-              yield node
-              for k in ("inner",):
-                if k in node and isinstance(node[k], list):
-                  for ch in node[k]:
-                    yield from iter_nodes(ch)
-            elif isinstance(node, list):
-              for it in node:
-                yield from iter_nodes(it)
+    seen: Set[str] = set()
 
-          def node_kind(node):
-            return node.get("kind")
+    def node_id(n: Dict[str, Any]) -> str:
+        kind = str(n.get("kind",""))
+        name = str(n.get("name",""))
+        file = str(get_loc_file(n) or "")
+        # include clang internal id if present for stability
+        cid = str(n.get("id",""))
+        return stable_id(kind, name, file, cid, json.dumps(n.get("range",{}), sort_keys=True))
 
-          def find_function_decls(ast_root):
-            funcs = {}
-            for n in iter_nodes(ast_root):
-              if node_kind(n) == "FunctionDecl" and "name" in n:
-                funcs.setdefault(n["name"], n)
-                if any(isinstance(ch, dict) and ch.get("kind") == "CompoundStmt" for ch in n.get("inner", []) or []):
-                  funcs[n["name"]] = n
-            return funcs
+    def add_node(n: Dict[str, Any], label: str="ASTNode"):
+        nid = node_id(n)
+        if nid in seen:
+            return nid
+        seen.add(nid)
+        kind = str(n.get("kind","")).replace(",", " ")
+        name = str(n.get("name","")).replace(",", " ")
+        file = str(get_loc_file(n) or "").replace(",", " ")
+        nodes_csv.write_text("", encoding="utf-8")  # ensure file exists
+        with nodes_csv.open("a", encoding="utf-8") as f:
+            f.write(f"{nid},{label},{kind},{name},{file}\\n")
+        return nid
 
-          def find_calls_in_function(func_node):
-            calls = set()
-            for n in iter_nodes(func_node):
-              if node_kind(n) == "CallExpr":
-                for ch in n.get("inner", []) or []:
-                  if not isinstance(ch, dict):
-                    continue
-                  k = node_kind(ch)
-                  if k == "DeclRefExpr":
-                    rd = ch.get("referencedDecl")
-                    if isinstance(rd, dict) and rd.get("kind") == "FunctionDecl" and rd.get("name"):
-                      calls.add(rd["name"])
-                    if ch.get("name"):
-                      calls.add(ch["name"])
-            return calls
+    def add_rel(a: str, b: str, typ: str):
+        with rels_csv.open("a", encoding="utf-8") as f:
+            f.write(f"{a},{b},{typ}\\n")
 
-          def safe_id(s):
-            return re.sub(r'[^A-Za-z0-9_]+', '_', s)
+    for mf in merged_funcs:
+        func_label = "Function"
+        fid = add_node(mf, func_label)
 
-          def merge_asts(global_funcs):
-            merged = {}
-            for fname, fnode in global_funcs.items():
-              caller = json.loads(json.dumps(fnode))
-              calls = find_calls_in_function(fnode)
+        # walk tree and build edges
+        def rec(parent: Optional[Dict[str, Any]], cur: Any):
+            if isinstance(cur, dict):
+                cid = add_node(cur, "ASTNode")
+                if parent is not None:
+                    pid = add_node(parent, "ASTNode")
+                    add_rel(pid, cid, "HAS_CHILD")
+                else:
+                    add_rel(fid, cid, "CONTAINS")
 
-              inline_nodes = []
-              for callee in sorted(calls):
-                if callee == fname:
-                  continue
-                callee_node = global_funcs.get(callee)
-                if not callee_node:
-                  # unresolved -> skip
-                  continue
-                inline_nodes.append({
-                  "kind": "InlineCallee",
-                  "name": callee,
-                  "inner": [callee_node],
-                })
+                for k, v in cur.items():
+                    if isinstance(v, (dict, list)):
+                        rec(cur, v)
+            elif isinstance(cur, list):
+                for it in cur:
+                    rec(parent, it)
 
-              caller.setdefault("inner", [])
-              caller["inner"].extend(inline_nodes)
-              merged[fname] = caller
-            return merged
+        rec(None, mf)
 
-          def export_neo4j_csv(merged_funcs, out_nodes_csv, out_edges_csv):
-            import csv
+    print(f"[OK] Neo4J AST CSV: {nodes_csv}, {rels_csv}")
 
-            nodes = []
-            edges = []
+def export_neo4j_dfd(merged_funcs: List[Dict[str, Any]], idx: FuncIndex):
+    # DFD model:
+    # - (:Function {id, name, file})
+    # - (:Function)-[:CALL {flow}]->(:Function)
+    # - (:Function)-[:RETURN {flow}]->(:Function)
+    #
+    # flow naming rules per your spec:
+    # - caller -> callee flow name: callee parameter names (if available); else fallback to call arg tokens
+    # - callee -> caller flow name: return value token; if none -> "function return(void)"
+    nodes_csv = NEO4J_DFD_DIR / "dfd_nodes.csv"
+    rels_csv  = NEO4J_DFD_DIR / "dfd_rels.csv"
+    nodes_csv.write_text(":ID,:LABEL,name,file\\n", encoding="utf-8")
+    rels_csv.write_text(":START_ID,:END_ID,:TYPE,flow\\n", encoding="utf-8")
 
-            def add_node(node_id, label, name, kind):
-              nodes.append({
-                "id:ID": node_id,
-                "label:LABEL": label,
-                "name": name,
-                "kind": kind,
-              })
+    func_ids: Dict[str, str] = {}  # name->id (best-effort)
 
-            def add_edge(src, dst, rel_type):
-              edges.append({
-                ":START_ID": src,
-                ":END_ID": dst,
-                ":TYPE": rel_type,
-              })
+    def upsert_func(fn: Dict[str, Any]) -> str:
+        name = str(fn.get("name",""))
+        file = str(get_loc_file(fn) or "")
+        fid = stable_id("func", name, file)
+        key = f"{name}@@{file}"
+        if key in func_ids:
+            return func_ids[key]
+        func_ids[key] = fid
+        with nodes_csv.open("a", encoding="utf-8") as f:
+            f.write(f"{fid},Function,{name.replace(',', ' ')},{file.replace(',', ' ')}\\n")
+        return fid
 
-            for func_name, ast in merged_funcs.items():
-              f_id = f"FUNC_{safe_id(func_name)}"
-              add_node(f_id, "Function", func_name, "FunctionDecl")
+    def add_rel(a: str, b: str, typ: str, flow: str):
+        flow = (flow or "").replace(",", " ")
+        with rels_csv.open("a", encoding="utf-8") as f:
+            f.write(f"{a},{b},{typ},{flow}\\n")
 
-              for n in ast.get("inner", []) or []:
-                if isinstance(n, dict) and n.get("kind") == "InlineCallee" and n.get("name"):
-                  callee = n["name"]
-                  inl_id = f"INL_{safe_id(func_name)}__{safe_id(callee)}"
-                  add_node(inl_id, "Inline", f"{func_name} -> {callee}", "InlineCallee")
-                  add_edge(f_id, inl_id, "INLINE")
+    # Build DFD edges from merged AST call sites
+    for caller in merged_funcs:
+        caller_id = upsert_func(caller)
+        caller_name = str(caller.get("name",""))
 
-                  c_id = f"FUNC_{safe_id(callee)}"
-                  add_node(c_id, "Function", callee, "FunctionDecl")
-                  add_edge(inl_id, c_id, "TARGET")
+        for call in extract_calls(caller):
+            callee = callee_name_from_call(call)
+            if not callee:
+                continue
 
-            uniq = {}
-            for n in nodes:
-              uniq[n["id:ID"]] = n
-            nodes = list(uniq.values())
+            cand = idx.get_best_def(callee)
+            if not cand:
+                # unresolved -> skip
+                continue
 
-            with open(out_nodes_csv, "w", newline="", encoding="utf-8") as f:
-              w = csv.DictWriter(f, fieldnames=["id:ID","label:LABEL","name","kind"])
-              w.writeheader()
-              for r in sorted(nodes, key=lambda x: x["id:ID"]):
-                w.writerow(r)
+            callee_node = cand["node"]
+            callee_file = cand["file"]
+            # enforce current constraint: only merge/dfd edges for in-scope targets
+            if not (isinstance(callee_file, str) and (SRC_DIR in callee_file or INC_DIR in callee_file or is_under_dirs(callee_file))):
+                continue
 
-            with open(out_edges_csv, "w", newline="", encoding="utf-8") as f:
-              w = csv.DictWriter(f, fieldnames=[":START_ID",":END_ID",":TYPE"])
-              w.writeheader()
-              for r in edges:
-                w.writerow(r)
+            callee_id = upsert_func(callee_node)
 
-          def main():
-            ap = argparse.ArgumentParser()
-            ap.add_argument("--raw_ast_dir", required=True)
-            ap.add_argument("--merged_ast_dir", required=True)
-            ap.add_argument("--neo4j_dir", required=True)
-            args = ap.parse_args()
+            # caller -> callee: use callee param names if possible
+            params = function_params(callee_node)
+            if params:
+                flow_call = " ".join(params)
+            else:
+                flow_call = " ".join(callee_args_from_call(call))
+            if not flow_call.strip():
+                flow_call = "(no-params)"
+            add_rel(caller_id, callee_id, "CALL", flow_call)
 
-            raw_files = sorted(glob.glob(os.path.join(args.raw_ast_dir, "*.ast.json")))
-            if not raw_files:
-              raise SystemExit(f"No AST JSON files found in {args.raw_ast_dir}")
+            # callee -> caller: return token
+            ret_tokens = function_return_tokens(callee_node)
+            flow_ret = ret_tokens[0] if ret_tokens else "function return(void)"
+            add_rel(callee_id, caller_id, "RETURN", flow_ret)
 
-            global_funcs = {}
-            for p in raw_files:
-              ast = load_json(p)
-              funcs = find_function_decls(ast)
-              for k, v in funcs.items():
-                global_funcs[k] = v
+    print(f"[OK] Neo4J DFD CSV: {nodes_csv}, {rels_csv}")
 
-            merged_funcs = merge_asts(global_funcs)
+def main():
+    asts = load_all_asts()
+    if not asts:
+        print("[ERROR] No AST JSON files found. Run gen_ast_json stage first.")
+        return
 
-            os.makedirs(args.merged_ast_dir, exist_ok=True)
-            for func_name, merged_ast in merged_funcs.items():
-              outp = os.path.join(args.merged_ast_dir, f"{safe_id(func_name)}.merged.ast.json")
-              with open(outp, "w", encoding="utf-8") as f:
-                json.dump(merged_ast, f, ensure_ascii=False)
+    idx = build_index(asts)
 
-            os.makedirs(args.neo4j_dir, exist_ok=True)
-            nodes_csv = os.path.join(args.neo4j_dir, "nodes.csv")
-            edges_csv = os.path.join(args.neo4j_dir, "edges.csv")
-            export_neo4j_csv(merged_funcs, nodes_csv, edges_csv)
+    # Choose "root functions" = all function definitions found in-scope,
+    # then merge each one (caller-expansion).
+    merged_funcs = []
+    for name, cands in idx.defs.items():
+        # pick best definition as a root if it is a definition and in-scope
+        best = idx.get_best_def(name)
+        if not best:
+            continue
+        fn = best["node"]
+        file = best["file"]
+        if not is_function_definition(fn):
+            continue
+        if not (isinstance(file, str) and (SRC_DIR in file or INC_DIR in file or is_under_dirs(file))):
+            continue
 
-            print(f"[OK] merged_ast_dir={args.merged_ast_dir}")
-            print(f"[OK] neo4j_csv={nodes_csv}, {edges_csv}")
+        visited = set()
+        mf = merge_ast(fn, idx, visited)
+        merged_funcs.append(mf)
 
-          if __name__ == "__main__":
-            main()
-          EOF
-        '''
-      }
-    }
+    # Export Neo4J formats
+    export_neo4j_ast_graph(merged_funcs)
+    export_neo4j_dfd(merged_funcs, idx)
 
-    stage('Generate AST per .c file') {
-      steps {
+    # Also store merged AST json (optional, but useful)
+    merged_out = Path(OUT_DIR) / "merged_ast.json"
+    merged_out.write_text(json.dumps(merged_funcs, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[OK] merged AST JSON saved: {merged_out}")
+
+if __name__ == "__main__":
+    main()
+'''
         sh '''
-          set -euxo pipefail
-          REPO_ROOT="$PWD"
-          mkdir -p "${RAW_AST_DIR}"
-
-          mapfile -t CFILES < <(find "${C_SRC_DIR}" -type f -name "*.c" | sort)
-          echo "Found ${#CFILES[@]} C files under ${C_SRC_DIR}"
-
-          for f in "${CFILES[@]}"; do
-            scripts/gen_ast.sh "${CLANG_BIN}" "${REPO_ROOT}" "${f}" "${RAW_AST_DIR}" "${H_INC_DIR}" "${EXTRA_INCLUDE_DIRS}" || true
-          done
-
-          echo "Generated AST count:"
-          ls -1 "${RAW_AST_DIR}"/*.ast.json 2>/dev/null | wc -l || true
-        '''
-      }
-    }
-
-    stage('Merge ASTs (caller <- callee) & Export Neo4j CSV') {
-      steps {
-        sh '''
-          set -euxo pipefail
-          "${PYTHON_BIN}" scripts/merge_and_export.py \
-            --raw_ast_dir "${RAW_AST_DIR}" \
-            --merged_ast_dir "${MERGED_AST_DIR}" \
-            --neo4j_dir "${NEO4J_DIR}"
+          set -eux
+          chmod +x merge_and_export_neo4j.py
+          "${PY}" merge_and_export_neo4j.py
         '''
       }
     }
 
     stage('Archive artifacts') {
       steps {
-        archiveArtifacts artifacts: 'out_ast/**', fingerprint: true
+        archiveArtifacts artifacts: 'artifacts/**', fingerprint: true
       }
     }
   }
 
   post {
     always {
-      sh '''
-        set +e
-        echo "Workspace: $PWD"
-        echo "Artifacts under out_ast/"
-        find out_ast -maxdepth 3 -type f | sed 's#^# - #' || true
-      '''
+      sh 'ls -R artifacts || true'
+    }
+    failure {
+      echo "Build failed. Check artifacts/logs/*.clang.log for clang failures."
     }
   }
 }
