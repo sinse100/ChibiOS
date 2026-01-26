@@ -27,5 +27,12 @@
     "-Ios/oslib/src",
     "-Ios/hal/include",
     "-Ios/hal/src"
+  ],
+
+  "source_globs": [
+    "os/rt/src/**/*.c",
+    "os/oslib/src/**/*.c",
+    "os/hal/src/**/*.c",
+    "os/common/ports/ARMv6-M-RP2/**/*.c"
   ]
 }
