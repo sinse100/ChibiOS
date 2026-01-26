@@ -1,476 +1,348 @@
-// Jenkinsfile (v17 FIX: Python 백슬래시 이스케이프 문제 해결 + ast_paths.json 표준 덮어쓰기)
 pipeline {
   agent any
 
   options {
+    timestamps()
+    ansiColor('xterm')
     buildDiscarder(logRotator(numToKeepStr: '30'))
   }
 
-  environment {
-    AST_STORE = "/var/lib/jenkins/ast/chibios-os-rt"
-
-    CLANG = "clang"
-    PY = "python3"
-
-    BUILD_CMD = "make -C testrt"
-    BUILD_CMD_BASELINE = "${BUILD_CMD}"
-
-    AST_PATHS_CONFIG = "tools/ast_ci/ast_paths.json"
+  parameters {
+    string(name: 'REPO_URL', defaultValue: 'https://github.com/sinse100/ChibiOS', description: 'Target repository URL')
+    string(name: 'BRANCH', defaultValue: 'master', description: 'Git branch to build')
+    string(name: 'C_SRC_DIR', defaultValue: 'os/rt/src', description: 'Directory containing .c files')
+    string(name: 'H_INC_DIR', defaultValue: 'os/rt/include', description: 'Directory containing .h files (include path)')
+    string(name: 'EXTRA_INCLUDE_DIRS', defaultValue: '', description: 'Extra include dirs (comma-separated, relative to repo root)')
+    string(name: 'CLANG_BIN', defaultValue: 'clang', description: 'clang executable name/path')
+    string(name: 'PYTHON_BIN', defaultValue: 'python3', description: 'python executable name/path')
   }
 
-  triggers {
-    pollSCM('H/5 * * * *')
+  environment {
+    OUT_DIR = "out_ast"
+    RAW_AST_DIR = "out_ast/raw_ast"
+    MERGED_AST_DIR = "out_ast/merged_ast"
+    NEO4J_DIR = "out_ast/neo4j"
   }
 
   stages {
-
     stage('Checkout') {
       steps {
-        checkout scm
-        sh 'git rev-parse --short HEAD'
-      }
-    }
-
-    stage('sudo 권한 사전 점검') {
-      steps {
+        deleteDir()
+        checkout([$class: 'GitSCM',
+          branches: [[name: "*/${params.BRANCH}"]],
+          userRemoteConfigs: [[url: params.REPO_URL]]
+        ])
         sh '''
-          set -eux
-          sudo -n true
-          echo "[OK] jenkins 계정이 비밀번호 없이 sudo 사용 가능"
+          set -euxo pipefail
+          git rev-parse --abbrev-ref HEAD
+          git rev-parse HEAD
         '''
       }
     }
 
-    stage('AST 실행 여부 판단') {
-      steps {
-        script {
-          sh '''
-            mkdir -p "${AST_STORE}/baseline"
-            git fetch origin master:refs/remotes/origin/master
-            set -e
-            git diff --name-only origin/master..HEAD | grep -E '^(os/rt/|os/common/ports/ARMv6-M-RP2/|os/rt/templates/|os/oslib/src/|os/hal/src/)' || true
-          '''
-          echo "Baseline AST가 존재하지 않음 → 최초 baseline 생성"
-        }
-      }
-    }
-
-    stage('의존성 설치') {
+    // ✅ 요청 반영: AST 생성 + 병합 + Neo4j import 파일 변환에 필요한 툴을 설치하는 stage를 완전 반영
+    stage('Install toolchain (AST + Neo4j export)') {
       steps {
         sh '''
-          set -eux
-          export DEBIAN_FRONTEND=noninteractive
-          command -v clang || (sudo -n apt-get update && sudo -n apt-get install -y clang bear jq python3)
-          sudo -n apt-get update
-          sudo -n apt-get install -y clang bear jq python3
+          set -euxo pipefail
+
+          # 0) Basic
+          sudo apt-get update
+
+          # 1) AST generation toolchain
+          sudo apt-get install -y --no-install-recommends \
+            git \
+            clang llvm \
+            build-essential
+
+          # 2) Transform/export toolchain
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-pip \
+            jq
+
+          # 3) Python libs used by merge/export script
+          python3 -m pip install --upgrade pip
+          python3 -m pip install networkx
+
+          # 4) Version checks (helps debugging in Jenkins logs)
+          echo "---- Versions ----"
+          clang --version || true
+          python3 --version || true
+          pip --version || true
+          jq --version || true
         '''
       }
     }
 
-    stage('AST 분석 스크립트 생성') {
+    stage('Prepare output dirs & scripts') {
       steps {
         sh '''
-          set -eux
-          mkdir -p tools/ast_ci
-          mkdir -p tools/ast_ci/generated
+          set -euxo pipefail
+          mkdir -p "${OUT_DIR}" "${RAW_AST_DIR}" "${MERGED_AST_DIR}" "${NEO4J_DIR}" scripts
 
-          # (기존 로직) chlicense.h 처리
-          if [ ! -f chlicense.h ] && [ ! -f os/license/chlicense.h ]; then
-            echo "[INFO] chlicense.h 없음 → 더미 생성"
-            cat > tools/ast_ci/generated/chlicense.h <<'EOF'
-#ifndef CHLICENSE_H
-#define CHLICENSE_H
-#endif
-EOF
-          else
-            echo "[INFO] chlicense.h가 트리에 존재합니다(더미 생성 생략)."
+          # -------- scripts/gen_ast.sh --------
+          cat > scripts/gen_ast.sh << 'EOF'
+          #!/usr/bin/env bash
+          set -euxo pipefail
+
+          CLANG_BIN="$1"
+          REPO_ROOT="$2"
+          C_FILE_REL="$3"
+          RAW_AST_DIR="$4"
+          INC_DIR_REL="$5"
+          EXTRA_INCS_CSV="$6"
+
+          C_FILE_ABS="${REPO_ROOT}/${C_FILE_REL}"
+
+          # Build include flags
+          INC_FLAGS="-I${REPO_ROOT}/${INC_DIR_REL}"
+          if [[ -n "${EXTRA_INCS_CSV}" ]]; then
+            IFS=',' read -ra EXTRA <<< "${EXTRA_INCS_CSV}"
+            for d in "${EXTRA[@]}"; do
+              d_trim="$(echo "$d" | xargs)"
+              [[ -n "$d_trim" ]] && INC_FLAGS="${INC_FLAGS} -I${REPO_ROOT}/${d_trim}"
+            done
           fi
 
-          # ast_paths.json: repo 파일이 있더라도, 업로드본과 항상 동일하게 맞추기 위해 매 빌드마다 덮어씀
-          echo "[INFO] tools/ast_ci/ast_paths.json 을 표준 설정으로 덮어씁니다."
-          cat > tools/ast_ci/ast_paths.json <<'EOF'
-{
-  "watched_prefixes": [
-    "os/rt/",
-    "os/common/ports/ARMv6-M-RP2/",
-    "os/rt/templates/",
-    "os/oslib/src/",
-    "os/hal/src/"
-  ],
-  "extra_dep_prefixes": [
-    "os/common/ports/ARMv6-M-RP2/",
-    "os/rt/templates/",
-    "os/oslib/src/",
-    "os/hal/src/"
-  ],
-  "extra_dep_headers": [
-    "os/common/ports/ARMv6-M-RP2/",
-    "os/rt/templates/",
-    "os/oslib/include/",
-    "os/hal/include/"
-  ],
-  "rt_tu_root": "os/rt/src",
-  "fallback_includes": [
-    "-Ios/rt/include",
-    "-Ios/rt/templates",
-    "-Ios/common/ports/ARMv6-M-RP2",
-    "-Ios/oslib/include",
-    "-Ios/oslib/src",
-    "-Ios/hal/include",
-    "-Ios/hal/src"
-  ]
-}
-EOF
+          # Output name: path-safe
+          SAFE_NAME="$(echo "${C_FILE_REL}" | sed 's#[/ ]#_#g')"
+          OUT_JSON="${RAW_AST_DIR}/${SAFE_NAME}.ast.json"
 
-          # chtypes.h 위치를 자동 탐색해 fallback include에 추가 (중복 방지)
-          CTYPES_FILE=$(git ls-files | grep -E '(^|/)chtypes\\.h$' | head -n 1 || true)
-          if [ -n "$CTYPES_FILE" ]; then
-            CTYPES_DIR=$(dirname "$CTYPES_FILE")
-            echo "[INFO] chtypes.h 발견: $CTYPES_FILE (dir=$CTYPES_DIR) → fallback_includes에 반영 시도"
-
-            tmp=$(mktemp)
-            jq --arg inc "-I${CTYPES_DIR}" '
-              if (.fallback_includes | index($inc)) then .
-              else .fallback_includes += [$inc]
-              end
-            ' tools/ast_ci/ast_paths.json > "$tmp" && mv "$tmp" tools/ast_ci/ast_paths.json
-
-            echo "[INFO] fallback_includes 업데이트 완료"
-          else
-            echo "[WARN] chtypes.h를 git 트리에서 찾지 못함"
-          fi
-
-          # Python 스크립트 생성 (FIX: 백슬래시 리터럴 제거 → chr(92) 사용)
-          cat > tools/ast_ci/ast_build_and_diff.py <<'PY'
-#!/usr/bin/env python3
-import argparse, os, json, subprocess, shutil, sys, glob, hashlib
-from datetime import datetime
-
-def run(cmd, **kw):
-    print("[CMD]", " ".join(cmd), flush=True)
-    return subprocess.run(cmd, **kw)
-
-def sha256_file(p):
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for b in iter(lambda: f.read(1024*1024), b""):
-            h.update(b)
-    return h.hexdigest()
-
-def clang_ast(src, out_json, includes, clang="clang"):
-    cmd = [clang, "-Xclang", "-ast-dump=json", "-fsyntax-only"] + includes + [src]
-    with open(out_json, "w") as f:
-        subprocess.run(cmd, stdout=f, check=True)
-
-def load_config(path):
-    with open(path, "r") as f:
-        return json.load(f)
-
-def collect_sources(globs_):
-    out = []
-    for g in globs_:
-        out += glob.glob(g, recursive=True)
-    return sorted(set(out))
-
-def ensure_compile_db(build_cmd, workdir="."):
-    if not build_cmd:
-        return None
-    if shutil.which("bear") is None:
-        raise RuntimeError("bear not found. please install bear.")
-    if os.path.exists("compile_commands.json"):
-        os.remove("compile_commands.json")
-    run(["bash", "-lc", f"bear -- {build_cmd}"], cwd=workdir, check=True)
-    if os.path.exists("compile_commands.json"):
-        return os.path.abspath("compile_commands.json")
-    return None
-
-def parse_compile_db(path):
-    with open(path, "r") as f:
-        return json.load(f)
-
-def incs_from_compile_db(cdb, src_path):
-    sp = os.path.abspath(src_path)
-    best = None
-    for e in cdb:
-        f = e.get("file")
-        if not f:
-            continue
-        ap = os.path.abspath(os.path.join(e.get("directory","."), f)) if not os.path.isabs(f) else os.path.abspath(f)
-        if ap == sp:
-            best = e
-            break
-    if not best:
-        return []
-    cmd = best.get("command")
-    if not cmd and "arguments" in best:
-        args = best["arguments"]
-    else:
-        args = cmd.split()
-    out = []
-    it = iter(args)
-    for a in it:
-        if a.startswith("-I") or a.startswith("-D") or a in ("-isystem", "-iquote"):
-            out.append(a)
-            if a in ("-isystem","-iquote"):
-                try:
-                    out.append(next(it))
-                except StopIteration:
-                    pass
-    return out
-
-def write_summary(outdir, base, head, mode, files, head_commit):
-    summary = {
-        "mode": mode,
-        "base": base,
-        "head": head,
-        "head_commit": head_commit,
-        "generated_at": datetime.utcnow().isoformat()+"Z",
-        "files": files
-    }
-    with open(os.path.join(outdir, "summary.json"), "w") as f:
-        json.dump(summary, f, indent=2)
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--outdir", required=True)
-    ap.add_argument("--base", required=True)
-    ap.add_argument("--head", required=True)
-    ap.add_argument("--mode", choices=["baseline","incremental"], required=True)
-    ap.add_argument("--build-cmd", default="")
-    ap.add_argument("--config", required=True)
-    args = ap.parse_args()
-
-    cfg = load_config(args.config)
-    globs_ = cfg.get("source_globs", [])
-    fallback_includes = cfg.get("fallback_includes", [])
-    extra_defines = cfg.get("extra_defines", [])
-
-    outdir = args.outdir
-    os.makedirs(outdir, exist_ok=True)
-
-    head_commit = subprocess.check_output(["git","rev-parse","--short",args.head]).decode().strip()
-
-    cdb = None
-    if args.build_cmd:
-        try:
-            cdb_path = ensure_compile_db(args.build_cmd)
-            if cdb_path:
-                cdb = parse_compile_db(cdb_path)
-        except Exception as e:
-            print("[WARN] compile DB 생성 실패, fallback includes로 진행:", e, file=sys.stderr)
-
-    sources = collect_sources(globs_)
-    files_meta = []
-
-    def incs_for(src):
-        incs = []
-        if cdb:
-            incs += incs_from_compile_db(cdb, src)
-        if not incs:
-            incs += fallback_includes
-        incs += extra_defines
-        seen = set()
-        dedup = []
-        for x in incs:
-            if x not in seen:
-                dedup.append(x)
-                seen.add(x)
-        return dedup
-
-    for src in sources:
-        rel = src.replace(chr(92), "/")
-        before_src = os.path.join(outdir, rel + ".before.c")
-        after_src  = os.path.join(outdir, rel + ".after.c")
-        os.makedirs(os.path.dirname(before_src), exist_ok=True)
-        shutil.copyfile(src, before_src)
-        shutil.copyfile(src, after_src)
-
-        before_ast = before_src + ".ast.json"
-        after_ast  = after_src + ".ast.json"
-
-        clang_ast(before_src, before_ast, incs_for(src), clang=os.environ.get("CLANG","clang"))
-        clang_ast(after_src,  after_ast,  incs_for(src), clang=os.environ.get("CLANG","clang"))
-
-        files_meta.append({
-            "source": rel,
-            "before_ast": before_ast.replace(chr(92), "/"),
-            "after_ast":  after_ast.replace(chr(92), "/"),
-            "before_sha256": sha256_file(before_ast),
-            "after_sha256":  sha256_file(after_ast),
-        })
-
-    write_summary(outdir, args.base, args.head, args.mode, files_meta, head_commit)
-    print("[OK] summary.json written:", os.path.join(outdir, "summary.json"))
-
-if __name__ == "__main__":
-    main()
-PY
-          chmod +x tools/ast_ci/ast_build_and_diff.py
-
-          cat > tools/ast_ci/ast_merge.py <<'PY'
-#!/usr/bin/env python3
-import argparse, os, json, glob
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", required=True)
-    ap.add_argument("--max-depth", type=int, default=3)
-    args = ap.parse_args()
-
-    ast_files = glob.glob(os.path.join(args.dir, "**", "*.ast.json"), recursive=True)
-    merged = {"files": []}
-    for f in sorted(ast_files):
-      merged["files"].append(f.replace(chr(92), "/"))
-
-    with open(os.path.join(args.dir, "merged_ast_index.json"), "w") as out:
-      json.dump(merged, out, indent=2)
-
-    print("[OK] merged_ast_index.json written:", os.path.join(args.dir, "merged_ast_index.json"))
-
-if __name__ == "__main__":
-    main()
-PY
-          chmod +x tools/ast_ci/ast_merge.py
-        '''
-      }
-    }
-
-    stage('AST 생성 및 diff (롤백 포함))') {
-      steps {
-        timeout(time: 25, unit: 'MINUTES') {
-          sh '''
-            bash -lc '
-            set -euo pipefail
-
-            COMMIT=$(git rev-parse --short HEAD)
-            AST_ROOT="${AST_STORE}"
-            BASELINE_DIR="${AST_ROOT}/baseline"
-
-            mkdir -p "${AST_ROOT}"
-            mkdir -p "ast_out"
-
-            TS=$(date +%Y%m%d_%H%M%S)
-            TMP_BASE="${AST_ROOT}/.tmp_baseline_${COMMIT}_${TS}"
-            TMP_COMMIT="${AST_ROOT}/.tmp_commit_${COMMIT}_${TS}"
-
-            rollback() {
-              echo "[ROLLBACK] 빌드 실패 감지 → 임시 결과물 정리 및(필요 시) baseline 복구"
-              rm -rf "${TMP_BASE}" "${TMP_COMMIT}" || true
-
-              if [ -n "${BASELINE_BACKUP:-}" ] && [ -d "${BASELINE_BACKUP}" ]; then
-                echo "[ROLLBACK] baseline 복구 수행: ${BASELINE_BACKUP} → ${BASELINE_DIR}"
-                rm -rf "${BASELINE_DIR}" || true
-                mv "${BASELINE_BACKUP}" "${BASELINE_DIR}" || true
-              fi
+          # NOTE: You may need additional -D macros depending on ChibiOS config.
+          # Keep it light for syntax-only parsing.
+          "${CLANG_BIN}" -x c -fsyntax-only \
+            ${INC_FLAGS} \
+            -Xclang -ast-dump=json \
+            "${C_FILE_ABS}" > "${OUT_JSON}" || {
+              echo "[WARN] AST dump failed for ${C_FILE_REL} (skipping)."
+              rm -f "${OUT_JSON}"
+              exit 0
             }
-            trap rollback ERR
 
-            AST_MODE="incremental"
-            if [ ! -f "${BASELINE_DIR}/summary.json" ]; then
-              AST_MODE="baseline"
-            fi
+          echo "${OUT_JSON}"
+          EOF
+          chmod +x scripts/gen_ast.sh
 
-            if [ "${AST_MODE}" = "baseline" ]; then
-              OUT="ast_out/baseline_${COMMIT}"
-              mkdir -p "$OUT"
+          # -------- scripts/merge_and_export.py --------
+          cat > scripts/merge_and_export.py << 'EOF'
+          import argparse
+          import glob
+          import json
+          import os
+          import re
 
-              echo "[BASELINE] 전체 TU AST 생성 시작"
-              BASELINE_BUILD_CMD="${BUILD_CMD_BASELINE:-}"
-              ${PY} tools/ast_ci/ast_build_and_diff.py \
-                --outdir "$OUT" \
-                --base "HEAD" \
-                --head "HEAD" \
-                --mode "baseline" \
-                --build-cmd "${BASELINE_BUILD_CMD}" \
-                --config "${AST_PATHS_CONFIG}"
+          def load_json(path):
+            with open(path, 'r', encoding='utf-8') as f:
+              return json.load(f)
 
-              echo "[BASELINE] merged AST 생성 시작"
-              ${PY} tools/ast_ci/ast_merge.py --dir "$OUT" --max-depth 3
+          def iter_nodes(node):
+            if isinstance(node, dict):
+              yield node
+              for k in ("inner",):
+                if k in node and isinstance(node[k], list):
+                  for ch in node[k]:
+                    yield from iter_nodes(ch)
+            elif isinstance(node, list):
+              for it in node:
+                yield from iter_nodes(it)
 
-              mkdir -p "${TMP_BASE}"
-              rsync -a --delete "$OUT/" "${TMP_BASE}/"
+          def node_kind(node):
+            return node.get("kind")
 
-              if [ -d "${BASELINE_DIR}" ] && [ "$(ls -A "${BASELINE_DIR}" 2>/dev/null || true)" != "" ]; then
-                BASELINE_BACKUP="${AST_ROOT}/.backup_baseline_${TS}"
-                echo "[BASELINE] 기존 baseline 백업: ${BASELINE_DIR} → ${BASELINE_BACKUP}"
-                mv "${BASELINE_DIR}" "${BASELINE_BACKUP}"
-              fi
+          def find_function_decls(ast_root):
+            funcs = {}
+            for n in iter_nodes(ast_root):
+              if node_kind(n) == "FunctionDecl" and "name" in n:
+                funcs.setdefault(n["name"], n)
+                if any(isinstance(ch, dict) and ch.get("kind") == "CompoundStmt" for ch in n.get("inner", []) or []):
+                  funcs[n["name"]] = n
+            return funcs
 
-              echo "[BASELINE] baseline 원자적 교체: ${TMP_BASE} → ${BASELINE_DIR}"
-              rm -rf "${BASELINE_DIR}" || true
-              mv "${TMP_BASE}" "${BASELINE_DIR}"
+          def find_calls_in_function(func_node):
+            calls = set()
+            for n in iter_nodes(func_node):
+              if node_kind(n) == "CallExpr":
+                for ch in n.get("inner", []) or []:
+                  if not isinstance(ch, dict):
+                    continue
+                  k = node_kind(ch)
+                  if k == "DeclRefExpr":
+                    rd = ch.get("referencedDecl")
+                    if isinstance(rd, dict) and rd.get("kind") == "FunctionDecl" and rd.get("name"):
+                      calls.add(rd["name"])
+                    if ch.get("name"):
+                      calls.add(ch["name"])
+            return calls
 
-              if [ -n "${BASELINE_BACKUP:-}" ] && [ -d "${BASELINE_BACKUP}" ]; then
-                echo "[BASELINE] 교체 성공 → 이전 baseline 백업 정리: ${BASELINE_BACKUP}"
-                rm -rf "${BASELINE_BACKUP}"
-              fi
+          def safe_id(s):
+            return re.sub(r'[^A-Za-z0-9_]+', '_', s)
 
-              echo "[BASELINE] 완료: ${BASELINE_DIR}/summary.json 생성 여부 확인"
-              ls -la "${BASELINE_DIR}" || true
+          def merge_asts(global_funcs):
+            merged = {}
+            for fname, fnode in global_funcs.items():
+              caller = json.loads(json.dumps(fnode))
+              calls = find_calls_in_function(fnode)
 
-            else
-              BASE_COMMIT=""
-              if [ -f "${BASELINE_DIR}/summary.json" ]; then
-                BASE_COMMIT=$(jq -r ".head_commit // .headCommit // empty" "${BASELINE_DIR}/summary.json" || true)
-              fi
-              if [ -z "${BASE_COMMIT}" ] || [ "${BASE_COMMIT}" = "null" ]; then
-                echo "[INCREMENTAL] baseline 기준 커밋을 못 읽음 → origin/master 사용"
-                BASE_REF="origin/master"
-              else
-                BASE_REF="${BASE_COMMIT}"
-                echo "[INCREMENTAL] baseline 기준 커밋: ${BASE_REF}"
-              fi
+              inline_nodes = []
+              for callee in sorted(calls):
+                if callee == fname:
+                  continue
+                callee_node = global_funcs.get(callee)
+                if not callee_node:
+                  # unresolved -> skip
+                  continue
+                inline_nodes.append({
+                  "kind": "InlineCallee",
+                  "name": callee,
+                  "inner": [callee_node],
+                })
 
-              OUT="ast_out/${COMMIT}"
-              mkdir -p "$OUT"
+              caller.setdefault("inner", [])
+              caller["inner"].extend(inline_nodes)
+              merged[fname] = caller
+            return merged
 
-              echo "[INCREMENTAL] 변경 TU AST 생성 + diff 시작"
-              ${PY} tools/ast_ci/ast_build_and_diff.py \
-                --outdir "$OUT" \
-                --base "${BASE_REF}" \
-                --head "HEAD" \
-                --mode "incremental" \
-                --build-cmd "${BUILD_CMD}" \
-                --config "${AST_PATHS_CONFIG}"
+          def export_neo4j_csv(merged_funcs, out_nodes_csv, out_edges_csv):
+            import csv
 
-              echo "[INCREMENTAL] merged AST 생성 시작"
-              ${PY} tools/ast_ci/ast_merge.py --dir "$OUT" --max-depth 3
+            nodes = []
+            edges = []
 
-              mkdir -p "${TMP_COMMIT}"
-              rsync -a --delete "$OUT/" "${TMP_COMMIT}/"
+            def add_node(node_id, label, name, kind):
+              nodes.append({
+                "id:ID": node_id,
+                "label:LABEL": label,
+                "name": name,
+                "kind": kind,
+              })
 
-              FINAL_COMMIT_DIR="${AST_ROOT}/${COMMIT}"
+            def add_edge(src, dst, rel_type):
+              edges.append({
+                ":START_ID": src,
+                ":END_ID": dst,
+                ":TYPE": rel_type,
+              })
 
-              if [ -d "${FINAL_COMMIT_DIR}" ] && [ "$(ls -A "${FINAL_COMMIT_DIR}" 2>/dev/null || true)" != "" ]; then
-                COMMIT_BACKUP="${AST_ROOT}/.backup_commit_${COMMIT}_${TS}"
-                echo "[INCREMENTAL] 기존 커밋 결과 백업: ${FINAL_COMMIT_DIR} → ${COMMIT_BACKUP}"
-                mv "${FINAL_COMMIT_DIR}" "${COMMIT_BACKUP}"
-              fi
+            for func_name, ast in merged_funcs.items():
+              f_id = f"FUNC_{safe_id(func_name)}"
+              add_node(f_id, "Function", func_name, "FunctionDecl")
 
-              echo "[INCREMENTAL] 커밋 결과 원자적 교체: ${TMP_COMMIT} → ${FINAL_COMMIT_DIR}"
-              rm -rf "${FINAL_COMMIT_DIR}" || true
-              mv "${TMP_COMMIT}" "${FINAL_COMMIT_DIR}"
+              for n in ast.get("inner", []) or []:
+                if isinstance(n, dict) and n.get("kind") == "InlineCallee" and n.get("name"):
+                  callee = n["name"]
+                  inl_id = f"INL_{safe_id(func_name)}__{safe_id(callee)}"
+                  add_node(inl_id, "Inline", f"{func_name} -> {callee}", "InlineCallee")
+                  add_edge(f_id, inl_id, "INLINE")
 
-              if [ -n "${COMMIT_BACKUP:-}" ] && [ -d "${COMMIT_BACKUP}" ]; then
-                echo "[INCREMENTAL] 교체 성공 → 이전 커밋 결과 백업 정리: ${COMMIT_BACKUP}"
-                rm -rf "${COMMIT_BACKUP}"
-              fi
+                  c_id = f"FUNC_{safe_id(callee)}"
+                  add_node(c_id, "Function", callee, "FunctionDecl")
+                  add_edge(inl_id, c_id, "TARGET")
 
-              echo "[INCREMENTAL] 완료: ${FINAL_COMMIT_DIR}/summary.json 확인"
-              ls -la "${FINAL_COMMIT_DIR}" || true
-            fi
+            uniq = {}
+            for n in nodes:
+              uniq[n["id:ID"]] = n
+            nodes = list(uniq.values())
 
-            trap - ERR
-            '
-          '''
-        }
+            with open(out_nodes_csv, "w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=["id:ID","label:LABEL","name","kind"])
+              w.writeheader()
+              for r in sorted(nodes, key=lambda x: x["id:ID"]):
+                w.writerow(r)
+
+            with open(out_edges_csv, "w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=[":START_ID",":END_ID",":TYPE"])
+              w.writeheader()
+              for r in edges:
+                w.writerow(r)
+
+          def main():
+            ap = argparse.ArgumentParser()
+            ap.add_argument("--raw_ast_dir", required=True)
+            ap.add_argument("--merged_ast_dir", required=True)
+            ap.add_argument("--neo4j_dir", required=True)
+            args = ap.parse_args()
+
+            raw_files = sorted(glob.glob(os.path.join(args.raw_ast_dir, "*.ast.json")))
+            if not raw_files:
+              raise SystemExit(f"No AST JSON files found in {args.raw_ast_dir}")
+
+            global_funcs = {}
+            for p in raw_files:
+              ast = load_json(p)
+              funcs = find_function_decls(ast)
+              for k, v in funcs.items():
+                global_funcs[k] = v
+
+            merged_funcs = merge_asts(global_funcs)
+
+            os.makedirs(args.merged_ast_dir, exist_ok=True)
+            for func_name, merged_ast in merged_funcs.items():
+              outp = os.path.join(args.merged_ast_dir, f"{safe_id(func_name)}.merged.ast.json")
+              with open(outp, "w", encoding="utf-8") as f:
+                json.dump(merged_ast, f, ensure_ascii=False)
+
+            os.makedirs(args.neo4j_dir, exist_ok=True)
+            nodes_csv = os.path.join(args.neo4j_dir, "nodes.csv")
+            edges_csv = os.path.join(args.neo4j_dir, "edges.csv")
+            export_neo4j_csv(merged_funcs, nodes_csv, edges_csv)
+
+            print(f"[OK] merged_ast_dir={args.merged_ast_dir}")
+            print(f"[OK] neo4j_csv={nodes_csv}, {edges_csv}")
+
+          if __name__ == "__main__":
+            main()
+          EOF
+        '''
+      }
+    }
+
+    stage('Generate AST per .c file') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          REPO_ROOT="$PWD"
+          mkdir -p "${RAW_AST_DIR}"
+
+          mapfile -t CFILES < <(find "${C_SRC_DIR}" -type f -name "*.c" | sort)
+          echo "Found ${#CFILES[@]} C files under ${C_SRC_DIR}"
+
+          for f in "${CFILES[@]}"; do
+            scripts/gen_ast.sh "${CLANG_BIN}" "${REPO_ROOT}" "${f}" "${RAW_AST_DIR}" "${H_INC_DIR}" "${EXTRA_INCLUDE_DIRS}" || true
+          done
+
+          echo "Generated AST count:"
+          ls -1 "${RAW_AST_DIR}"/*.ast.json 2>/dev/null | wc -l || true
+        '''
+      }
+    }
+
+    stage('Merge ASTs (caller <- callee) & Export Neo4j CSV') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          "${PYTHON_BIN}" scripts/merge_and_export.py \
+            --raw_ast_dir "${RAW_AST_DIR}" \
+            --merged_ast_dir "${MERGED_AST_DIR}" \
+            --neo4j_dir "${NEO4J_DIR}"
+        '''
+      }
+    }
+
+    stage('Archive artifacts') {
+      steps {
+        archiveArtifacts artifacts: 'out_ast/**', fingerprint: true
       }
     }
   }
 
   post {
     always {
-      echo "빌드 결과: ${currentBuild.currentResult}"
+      sh '''
+        set +e
+        echo "Workspace: $PWD"
+        echo "Artifacts under out_ast/"
+        find out_ast -maxdepth 3 -type f | sed 's#^# - #' || true
+      '''
     }
   }
 }
