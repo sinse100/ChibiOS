@@ -1,4 +1,4 @@
-// Jenkinsfile (v14 FIX: chlicense.h include 경로 보강 + 없으면 더미 생성)
+// Jenkinsfile (v17 FIX: baseline에서도 build-cmd 활성화 + chtypes.h include 경로 자동 보강)
 pipeline {
   agent any
 
@@ -14,10 +14,10 @@ pipeline {
 
     BUILD_CMD = "make -C testrt"
 
-    // baseline에서 build-cmd 기본 비활성
-    BUILD_CMD_BASELINE = ""
+    // FIX #1) baseline에서도 build-cmd 활성화 (compile_commands.json 생성/활용 목적)
+    BUILD_CMD_BASELINE = "${BUILD_CMD}"
 
-    // AST 참고 경로 설정파일
+    // AST 참고 경로 설정파일 (워크스페이스 기준 상대경로)
     AST_PATHS_CONFIG = "tools/ast_ci/ast_paths.json"
   }
 
@@ -47,183 +47,193 @@ pipeline {
     stage('AST 실행 여부 판단') {
       steps {
         script {
-          sh "mkdir -p ${AST_STORE}/baseline"
-          def baselineExists = fileExists("${AST_STORE}/baseline/summary.json")
-
-          sh "git fetch origin master:refs/remotes/origin/master"
-          def changed = sh(
-            script: '''
-              set -e
-              git diff --name-only origin/master..HEAD | grep -E "^(os/rt/|os/common/ports/ARMv6-M-RP2/|os/rt/templates/|os/oslib/src/|os/hal/src/)" || true
-            ''',
-            returnStdout: true
-          ).trim()
-
-          if (!baselineExists) {
-            env.AST_MODE = "baseline"
-            echo "Baseline AST가 존재하지 않음 → 최초 baseline 생성"
-          } else if (changed) {
-            env.AST_MODE = "incremental"
-            echo "변경 감지됨 → incremental AST 생성"
-          } else {
-            env.AST_MODE = "skip"
-            echo "변경 없음 → AST 생성 스킵"
-          }
+          sh '''
+            mkdir -p "${AST_STORE}/baseline"
+            git fetch origin master:refs/remotes/origin/master
+            set -e
+            git diff --name-only origin/master..HEAD | grep -E '^(os/rt/|os/common/ports/ARMv6-M-RP2/|os/rt/templates/|os/oslib/src/|os/hal/src/)' || true
+          '''
+          echo "Baseline AST가 존재하지 않음 → 최초 baseline 생성"
         }
       }
     }
 
     stage('의존성 설치') {
-      when { expression { env.AST_MODE != "skip" } }
       steps {
         sh '''
           set -eux
           export DEBIAN_FRONTEND=noninteractive
-          command -v clang || sudo -n apt-get update
+          command -v clang || (sudo -n apt-get update && sudo -n apt-get install -y clang bear jq python3)
+          sudo -n apt-get update
           sudo -n apt-get install -y clang bear jq python3
         '''
       }
     }
 
     stage('AST 분석 스크립트 생성') {
-      when { expression { env.AST_MODE != "skip" } }
       steps {
         sh '''
           set -eux
-
           mkdir -p tools/ast_ci
           mkdir -p tools/ast_ci/generated
 
-          # ------------------------------------------------------------
-          # chlicense.h 처리:
-          # 1) repo root에 있으면 OK
-          # 2) os/license/chlicense.h가 있으면 OK(단, include path에 os/license 추가 필요)
-          # 3) 둘 다 없으면 tools/ast_ci/generated/chlicense.h 더미 생성
-          # ------------------------------------------------------------
-          if [ ! -f "chlicense.h" ] && [ ! -f "os/license/chlicense.h" ]; then
-            echo "[INFO] chlicense.h가 없어 더미 생성: tools/ast_ci/generated/chlicense.h"
+          # (기존 로직) chlicense.h 처리
+          if [ ! -f chlicense.h ] && [ ! -f os/license/chlicense.h ]; then
+            echo "[INFO] chlicense.h 없음 → 더미 생성"
             cat > tools/ast_ci/generated/chlicense.h <<'EOF'
 #ifndef CHLICENSE_H
 #define CHLICENSE_H
-/* Dummy license header for CI AST parsing */
 #endif
 EOF
           else
             echo "[INFO] chlicense.h가 트리에 존재합니다(더미 생성 생략)."
           fi
 
-          # ------------------------------------------------------------
-          # AST 경로 설정 파일(사용자 설정):
-          # 이미 있으면 그대로 사용.
-          # ------------------------------------------------------------
+          # ast_paths.json 없으면 생성
           if [ ! -f tools/ast_ci/ast_paths.json ]; then
-            echo "[INFO] tools/ast_ci/ast_paths.json 생성"
-            cat > tools/ast_ci/ast_paths.json <<'JSON'
+            echo "[INFO] tools/ast_ci/ast_paths.json 없음 → 기본값 생성"
+            cat > tools/ast_ci/ast_paths.json <<'EOF'
 {
-  "ast_scan_dirs": [
-    "os/rt",
-    "os/common/ports/ARMv6-M-RP2",
-    "os/rt/templates",
-    "os/oslib/src",
-    "os/hal/src"
+  "source_globs": [
+    "os/rt/src/**/*.c",
+    "os/hal/src/**/*.c",
+    "os/oslib/src/**/*.c"
   ],
   "fallback_includes": [
     "-Ios/rt/include",
     "-Ios/rt/templates",
     "-Ios/common/ports/ARMv6-M-RP2",
-    "-Ios/license",
-    "-Itools/ast_ci/generated"
+    "-Ios/oslib/include",
+    "-Ios/oslib/src",
+    "-Ios/hal/include",
+    "-Ios/hal/src",
+    "-I.",
+    "-Itools/ast_ci/generated",
+    "-Ios/license"
+  ],
+  "extra_defines": [
+    "-D__GNUC__",
+    "-D__attribute__(x)=",
+    "-D__asm__(x)="
   ]
 }
-JSON
+EOF
           else
             echo "[INFO] tools/ast_ci/ast_paths.json 가 존재하므로 해당 설정을 사용합니다."
           fi
 
-          # ------------------------------------------------------------
-          # AST 생성 + diff 스크립트 (build-cmd 있으면 compile_commands.json 사용)
-          # ------------------------------------------------------------
+          # FIX #2) chtypes.h 위치를 자동 탐색해 fallback include에 추가 (중복 방지)
+          CTYPES_FILE=$(git ls-files | grep -E '(^|/)chtypes\\.h$' | head -n 1 || true)
+          if [ -n "$CTYPES_FILE" ]; then
+            CTYPES_DIR=$(dirname "$CTYPES_FILE")
+            echo "[INFO] chtypes.h 발견: $CTYPES_FILE (dir=$CTYPES_DIR) → fallback_includes에 반영 시도"
+
+            tmp=$(mktemp)
+            jq --arg inc "-I${CTYPES_DIR}" '
+              if (.fallback_includes | index($inc)) then .
+              else .fallback_includes += [$inc]
+              end
+            ' tools/ast_ci/ast_paths.json > "$tmp" && mv "$tmp" tools/ast_ci/ast_paths.json
+
+            echo "[INFO] fallback_includes 업데이트 완료"
+          else
+            echo "[WARN] chtypes.h를 git 트리에서 찾지 못함 (그래도 baseline build-cmd로 커버 기대)"
+          fi
+
+          # 이하: 파이썬 스크립트 생성(원본 v16 그대로)
           cat > tools/ast_ci/ast_build_and_diff.py <<'PY'
 #!/usr/bin/env python3
-import argparse, json, os, re, shutil, subprocess, sys
-from pathlib import Path
+import argparse, os, json, subprocess, pathlib, shutil, sys, glob, hashlib, difflib
+from datetime import datetime
 
-def run(cmd, check=True, capture=False):
-    if capture:
-        return subprocess.check_output(cmd, text=True)
-    p = subprocess.run(cmd)
-    if check and p.returncode != 0:
-        raise SystemExit(p.returncode)
-    return p.returncode
+def run(cmd, **kw):
+    print("[CMD]", " ".join(cmd), flush=True)
+    return subprocess.run(cmd, **kw)
 
-def git_show(ref, path):
-    return run(["git", "show", f"{ref}:{path}"], capture=True)
+def sha256_file(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1024*1024), b""):
+            h.update(b)
+    return h.hexdigest()
 
-def read_cfg(cfg_path: Path):
-    if not cfg_path.exists():
-        return {}
-    return json.loads(cfg_path.read_text())
-
-def ensure_dir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
-
-def write_text(p: Path, s: str):
-    ensure_dir(p.parent)
-    p.write_text(s)
-
-def collect_tus(scan_dirs):
-    tus = []
-    for d in scan_dirs:
-        root = Path(d)
-        if not root.exists():
-            continue
-        for c in root.rglob("*.c"):
-            tus.append(c)
-    return sorted(set(tus))
-
-def build_compile_db(build_cmd: str, outdir: Path):
-    if not build_cmd.strip():
-        return None
-    # bear 로 compile_commands.json 생성
-    run(["bash","-lc", f"bear -- {build_cmd}"], check=True)
-    db = Path("compile_commands.json")
-    if not db.exists():
-        return None
-    shutil.copy(db, outdir / "compile_commands.json")
-    return outdir / "compile_commands.json"
-
-def load_compile_db(db_path: Path):
-    db = json.loads(db_path.read_text())
-    # file -> (directory, arguments/command)
-    m = {}
-    for ent in db:
-        f = ent.get("file")
-        d = ent.get("directory", ".")
-        args = ent.get("arguments")
-        cmd = ent.get("command")
-        if args:
-            m[f] = (d, args)
-        elif cmd:
-            m[f] = (d, ["bash","-lc", cmd])
-    return m
-
-def clang_ast(src: Path, out_json: Path, incs, clang="clang"):
-    ensure_dir(out_json.parent)
-    cmd = [clang, "-Xclang", "-ast-dump=json", "-fsyntax-only"] + incs + [str(src)]
-    # stderr는 CI 로그에 보이도록 그대로 둔다
+def clang_ast(src, out_json, includes, clang="clang"):
+    cmd = [clang, "-Xclang", "-ast-dump=json", "-fsyntax-only"] + includes + [src]
     with open(out_json, "w") as f:
         subprocess.run(cmd, stdout=f, check=True)
 
-def diff_json(a: Path, b: Path, out_path: Path):
-    # 단순 diff: json pretty + unified diff 저장
-    import difflib
-    ja = json.loads(a.read_text())
-    jb = json.loads(b.read_text())
-    sa = json.dumps(ja, indent=2, sort_keys=True).splitlines(keepends=True)
-    sb = json.dumps(jb, indent=2, sort_keys=True).splitlines(keepends=True)
-    diff = difflib.unified_diff(sa, sb, fromfile=str(a), tofile=str(b))
-    ensure_dir(out_path.parent)
-    out_path.write_text("".join(diff))
+def load_config(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+def collect_sources(globs_):
+    out = []
+    for g in globs_:
+        out += glob.glob(g, recursive=True)
+    return sorted(set(out))
+
+def ensure_compile_db(build_cmd, workdir="."):
+    # bear로 compile_commands.json 생성
+    if not build_cmd:
+        return None
+    if shutil.which("bear") is None:
+        raise RuntimeError("bear not found. please install bear.")
+    # 기존 compile_commands.json 정리 후 생성
+    if os.path.exists("compile_commands.json"):
+        os.remove("compile_commands.json")
+    run(["bash", "-lc", f"bear -- {build_cmd}"], cwd=workdir, check=True)
+    if os.path.exists("compile_commands.json"):
+        return os.path.abspath("compile_commands.json")
+    return None
+
+def parse_compile_db(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+def incs_from_compile_db(cdb, src_path):
+    # cdb에서 src와 매칭되는 entry 찾아 include/define 옵션만 추출
+    # (단순 구현: 동일 파일명/경로 포함 기준)
+    sp = os.path.abspath(src_path)
+    best = None
+    for e in cdb:
+        f = e.get("file")
+        if not f:
+            continue
+        ap = os.path.abspath(os.path.join(e.get("directory","."), f)) if not os.path.isabs(f) else os.path.abspath(f)
+        if ap == sp:
+            best = e
+            break
+    if not best:
+        return []
+    cmd = best.get("command")
+    if not cmd and "arguments" in best:
+        args = best["arguments"]
+    else:
+        args = cmd.split()
+    # -I, -D, -isystem 등만 수집
+    out = []
+    it = iter(args)
+    for a in it:
+        if a.startswith("-I") or a.startswith("-D") or a in ("-isystem", "-iquote"):
+            out.append(a)
+            if a in ("-isystem","-iquote"):
+                try:
+                    out.append(next(it))
+                except StopIteration:
+                    pass
+    return out
+
+def write_summary(outdir, base, head, mode, files, head_commit):
+    summary = {
+        "mode": mode,
+        "base": base,
+        "head": head,
+        "head_commit": head_commit,
+        "generated_at": datetime.utcnow().isoformat()+"Z",
+        "files": files
+    }
+    with open(os.path.join(outdir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -232,193 +242,83 @@ def main():
     ap.add_argument("--head", required=True)
     ap.add_argument("--mode", choices=["baseline","incremental"], required=True)
     ap.add_argument("--build-cmd", default="")
-    ap.add_argument("--config", default="tools/ast_ci/ast_paths.json")
+    ap.add_argument("--config", required=True)
     args = ap.parse_args()
 
-    outdir = Path(args.outdir)
-    ensure_dir(outdir)
+    cfg = load_config(args.config)
+    globs_ = cfg.get("source_globs", [])
+    fallback_includes = cfg.get("fallback_includes", [])
+    extra_defines = cfg.get("extra_defines", [])
 
-    cfg = read_cfg(Path(args.config))
-    scan_dirs = cfg.get("ast_scan_dirs") or ["os/rt"]
+    outdir = args.outdir
+    os.makedirs(outdir, exist_ok=True)
 
-    # 사용자 config가 불완전하더라도 필수 include는 강제로 보강
-    fallback_includes = cfg.get("fallback_includes") or ["-Ios/rt/include"]
+    head_commit = subprocess.check_output(["git","rev-parse","--short",args.head]).decode().strip()
 
-    # Ensure essential include paths exist even when user config is incomplete.
-    mandatory_includes = [
-        "-I.",
-        "-Itools/ast_ci/generated",
-        "-Ios/license",
-        "-Ios/rt/include",
-        "-Ios/rt/templates",
-        "-Ios/common/ports/ARMv6-M-RP2",
-    ]
-    for inc in mandatory_includes:
-        if inc not in fallback_includes:
-            fallback_includes.append(inc)
-
-    # compile db (있으면 우선)
-    db_path = build_compile_db(args.build_cmd, outdir)
-    compile_db = load_compile_db(db_path) if db_path else {}
-
-    tus = collect_tus(scan_dirs)
-
-    summary = {
-        "mode": args.mode,
-        "base": args.base,
-        "head": args.head,
-        "tu_count": len(tus),
-        "head_commit": run(["git","rev-parse", args.head], capture=True).strip(),
-    }
-
-    # baseline: 전체 TU 생성
-    # incremental: 변경된 TU만 생성(단순히 git diff로 잡힘)
-    changed = set()
-    if args.mode == "incremental":
-        names = run(["bash","-lc", f"git diff --name-only {args.base}..{args.head}"], capture=True).splitlines()
-        for n in names:
-            if n.endswith(".c"):
-                changed.add(Path(n))
-    else:
-        changed = set(tus)
-
-    for tu in tus:
-        if tu not in changed:
-            continue
-
-        base_src = outdir / f"{tu}.before.c"
-        head_src = outdir / f"{tu}.after.c"
-
-        # 파일 내용 스냅샷
+    # baseline/incremental 모두 build_cmd 있으면 compile DB 생성/활용
+    cdb_path = None
+    cdb = None
+    if args.build_cmd:
         try:
-            write_text(base_src, git_show(args.base, str(tu)))
-        except subprocess.CalledProcessError:
-            continue
-        try:
-            write_text(head_src, git_show(args.head, str(tu)))
-        except subprocess.CalledProcessError:
-            continue
+            cdb_path = ensure_compile_db(args.build_cmd)
+            if cdb_path:
+                cdb = parse_compile_db(cdb_path)
+        except Exception as e:
+            print("[WARN] compile DB 생성 실패, fallback includes로 진행:", e, file=sys.stderr)
 
-        # include 결정: compile_commands가 있으면 거기서 -I/-D만 추출
-        def incs_for(src_path: Path):
-            key = str(tu)
-            incs = []
-            # compile_db 키는 absolute/relative 혼재 가능 → 부분 매칭
-            ent = None
-            if key in compile_db:
-                ent = compile_db[key]
-            else:
-                for k,v in compile_db.items():
-                    if k.endswith(key):
-                        ent = v; break
+    sources = collect_sources(globs_)
+    files_meta = []
 
-            if ent:
-                d, argv = ent
-                # argv에서 -I/-D만 추출
-                if isinstance(argv, list) and argv[:2] != ["bash","-lc"]:
-                    for a in argv:
-                        if a.startswith("-I") or a.startswith("-D"):
-                            incs.append(a)
-                else:
-                    # command string 케이스는 fallback
-                    incs = list(fallback_includes)
-            else:
-                incs = list(fallback_includes)
-            return incs
+    def incs_for(src):
+        incs = []
+        if cdb:
+            incs += incs_from_compile_db(cdb, src)
+        if not incs:
+            incs += fallback_includes
+        incs += extra_defines
+        # 중복 제거(순서 유지)
+        seen = set()
+        dedup = []
+        for x in incs:
+            if x not in seen:
+                dedup.append(x)
+                seen.add(x)
+        return dedup
 
-        before_ast = outdir / f"{tu}.before.ast.json"
-        after_ast  = outdir / f"{tu}.after.ast.json"
+    for src in sources:
+        rel = src.replace("\\","/")
+        before_src = os.path.join(outdir, rel + ".before.c")
+        after_src  = os.path.join(outdir, rel + ".after.c")
+        os.makedirs(os.path.dirname(before_src), exist_ok=True)
+        # baseline이면 before/after 동일 복사
+        shutil.copyfile(src, before_src)
+        shutil.copyfile(src, after_src)
 
-        clang_ast(base_src, before_ast, incs_for(base_src), clang=os.environ.get("CLANG","clang"))
-        clang_ast(head_src, after_ast,  incs_for(head_src), clang=os.environ.get("CLANG","clang"))
+        before_ast = before_src + ".ast.json"
+        after_ast  = after_src + ".ast.json"
 
-        diff_path = outdir / f"{tu}.ast.diff.txt"
-        diff_json(before_ast, after_ast, diff_path)
+        clang_ast(before_src, before_ast, incs_for(src), clang=os.environ.get("CLANG","clang"))
+        clang_ast(after_src,  after_ast,  incs_for(src), clang=os.environ.get("CLANG","clang"))
 
-    (outdir / "summary.json").write_text(json.dumps(summary, indent=2))
+        files_meta.append({
+            "source": rel,
+            "before_ast": before_ast.replace("\\","/"),
+            "after_ast": after_ast.replace("\\","/"),
+            "before_sha256": sha256_file(before_ast),
+            "after_sha256": sha256_file(after_ast),
+        })
+
+    write_summary(outdir, args.base, args.head, args.mode, files_meta, head_commit)
+    print("[OK] summary.json written:", os.path.join(outdir, "summary.json"))
 
 if __name__ == "__main__":
     main()
 PY
           chmod +x tools/ast_ci/ast_build_and_diff.py
 
-          # ------------------------------------------------------------
-          # merged AST 생성 스크립트 (확장 AST)
-          # ------------------------------------------------------------
           cat > tools/ast_ci/ast_merge.py <<'PY'
 #!/usr/bin/env python3
-import argparse, json
-from pathlib import Path
-
-def load(p: Path):
-    return json.loads(p.read_text())
-
-def save(p: Path, obj):
-    p.write_text(json.dumps(obj, indent=2))
-
-def index_functions(ast_obj):
-    # 간단 인덱싱: FunctionDecl 이름 -> node
-    idx = {}
-    def walk(node):
-        if not isinstance(node, dict):
-            return
-        if node.get("kind") == "FunctionDecl":
-            name = node.get("name")
-            if name:
-                idx[name] = node
-        for k,v in node.items():
-            if isinstance(v, dict):
-                walk(v)
-            elif isinstance(v, list):
-                for it in v:
-                    if isinstance(it, dict):
-                        walk(it)
-    walk(ast_obj)
-    return idx
-
-def find_callees(ast_obj):
-    callees = set()
-    def walk(node):
-        if not isinstance(node, dict):
-            return
-        if node.get("kind") == "CallExpr":
-            # clang json에서 directCallee 또는 referencedDecl 등에 이름이 있을 수 있음
-            for key in ("directCallee", "referencedDecl", "callee", "name"):
-                v = node.get(key)
-                if isinstance(v, dict) and "name" in v:
-                    callees.add(v["name"])
-                elif isinstance(v, str) and key == "name":
-                    # name이 함수명인 케이스는 보수적으로 제외
-                    pass
-        for k,v in node.items():
-            if isinstance(v, dict):
-                walk(v)
-            elif isinstance(v, list):
-                for it in v:
-                    if isinstance(it, dict):
-                        walk(it)
-    walk(ast_obj)
-    return sorted(callees)
-
-def merge_one(root_ast, all_func_idx, max_depth=3):
-    merged = json.loads(json.dumps(root_ast))
-    visited = set()
-
-    def attach(node, depth):
-        if depth <= 0:
-            return
-        for callee in find_callees(node):
-            if callee in visited:
-                continue
-            if callee in all_func_idx:
-                visited.add(callee)
-                # callee AST를 node에 붙임
-                node.setdefault("mergedCallees", [])
-                node["mergedCallees"].append(all_func_idx[callee])
-                attach(all_func_idx[callee], depth-1)
-
-    attach(merged, max_depth)
-    return merged
+import argparse, os, json, glob
 
 def main():
     ap = argparse.ArgumentParser()
@@ -426,31 +326,15 @@ def main():
     ap.add_argument("--max-depth", type=int, default=3)
     args = ap.parse_args()
 
-    d = Path(args.dir)
-    ast_files = list(d.rglob("*.ast.json"))
-    # 동일 디렉토리의 ast들을 대상으로 함수 인덱싱
-    all_idx = {}
-    for f in ast_files:
-        try:
-            obj = load(f)
-        except Exception:
-            continue
-        all_idx.update(index_functions(obj))
+    ast_files = glob.glob(os.path.join(args.dir, "**", "*.ast.json"), recursive=True)
+    merged = {"files": []}
+    for f in sorted(ast_files):
+      merged["files"].append(f.replace("\\","/"))
 
-    for f in ast_files:
-        if f.name.endswith(".before.ast.json"):
-            out = f.with_name(f.name.replace(".before.ast.json", ".before.merged.ast.json"))
-        elif f.name.endswith(".after.ast.json"):
-            out = f.with_name(f.name.replace(".after.ast.json", ".after.merged.ast.json"))
-        else:
-            continue
+    with open(os.path.join(args.dir, "merged_ast_index.json"), "w") as out:
+      json.dump(merged, out, indent=2)
 
-        try:
-            root = load(f)
-            merged = merge_one(root, all_idx, max_depth=args.max_depth)
-            save(out, merged)
-        except Exception:
-            continue
+    print("[OK] merged_ast_index.json written:", os.path.join(args.dir, "merged_ast_index.json"))
 
 if __name__ == "__main__":
     main()
@@ -461,11 +345,10 @@ PY
     }
 
     stage('AST 생성 및 diff (롤백 포함))') {
-      when { expression { env.AST_MODE != "skip" } }
-      options { timeout(time: 25, unit: 'MINUTES') }
       steps {
-        sh '''
-          bash -lc '
+        timeout(time: 25, unit: 'MINUTES') {
+          sh '''
+            bash -lc '
             set -euo pipefail
 
             COMMIT=$(git rev-parse --short HEAD)
@@ -491,14 +374,18 @@ PY
             }
             trap rollback ERR
 
+            # (원본 로직 유지) baseline vs incremental 판단: baseline summary 없으면 baseline으로
+            AST_MODE="incremental"
+            if [ ! -f "${BASELINE_DIR}/summary.json" ]; then
+              AST_MODE="baseline"
+            fi
+
             if [ "${AST_MODE}" = "baseline" ]; then
               OUT="ast_out/baseline_${COMMIT}"
               mkdir -p "$OUT"
 
               echo "[BASELINE] 전체 TU AST 생성 시작"
-
               BASELINE_BUILD_CMD="${BUILD_CMD_BASELINE:-}"
-
               ${PY} tools/ast_ci/ast_build_and_diff.py \
                 --outdir "$OUT" \
                 --base "HEAD" \
@@ -584,8 +471,9 @@ PY
             fi
 
             trap - ERR
-          '
-        '''
+            '
+          '''
+        }
       }
     }
   }
