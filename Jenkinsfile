@@ -1,4 +1,4 @@
-// Jenkinsfile (v17 FIX: baseline에서도 build-cmd 활성화 + chtypes.h include 경로 자동 보강)
+// Jenkinsfile (v17 FIX: Python 백슬래시 이스케이프 문제 해결 + ast_paths.json 표준 덮어쓰기)
 pipeline {
   agent any
 
@@ -13,11 +13,8 @@ pipeline {
     PY = "python3"
 
     BUILD_CMD = "make -C testrt"
-
-    // FIX #1) baseline에서도 build-cmd 활성화 (compile_commands.json 생성/활용 목적)
     BUILD_CMD_BASELINE = "${BUILD_CMD}"
 
-    // AST 참고 경로 설정파일 (워크스페이스 기준 상대경로)
     AST_PATHS_CONFIG = "tools/ast_ci/ast_paths.json"
   }
 
@@ -89,16 +86,30 @@ EOF
             echo "[INFO] chlicense.h가 트리에 존재합니다(더미 생성 생략)."
           fi
 
-          # ast_paths.json 없으면 생성
-          if [ ! -f tools/ast_ci/ast_paths.json ]; then
-            echo "[INFO] tools/ast_ci/ast_paths.json 없음 → 기본값 생성"
-            cat > tools/ast_ci/ast_paths.json <<'EOF'
+          # ast_paths.json: repo 파일이 있더라도, 업로드본과 항상 동일하게 맞추기 위해 매 빌드마다 덮어씀
+          echo "[INFO] tools/ast_ci/ast_paths.json 을 표준 설정으로 덮어씁니다."
+          cat > tools/ast_ci/ast_paths.json <<'EOF'
 {
-  "source_globs": [
-    "os/rt/src/**/*.c",
-    "os/hal/src/**/*.c",
-    "os/oslib/src/**/*.c"
+  "watched_prefixes": [
+    "os/rt/",
+    "os/common/ports/ARMv6-M-RP2/",
+    "os/rt/templates/",
+    "os/oslib/src/",
+    "os/hal/src/"
   ],
+  "extra_dep_prefixes": [
+    "os/common/ports/ARMv6-M-RP2/",
+    "os/rt/templates/",
+    "os/oslib/src/",
+    "os/hal/src/"
+  ],
+  "extra_dep_headers": [
+    "os/common/ports/ARMv6-M-RP2/",
+    "os/rt/templates/",
+    "os/oslib/include/",
+    "os/hal/include/"
+  ],
+  "rt_tu_root": "os/rt/src",
   "fallback_includes": [
     "-Ios/rt/include",
     "-Ios/rt/templates",
@@ -106,23 +117,12 @@ EOF
     "-Ios/oslib/include",
     "-Ios/oslib/src",
     "-Ios/hal/include",
-    "-Ios/hal/src",
-    "-I.",
-    "-Itools/ast_ci/generated",
-    "-Ios/license"
-  ],
-  "extra_defines": [
-    "-D__GNUC__",
-    "-D__attribute__(x)=",
-    "-D__asm__(x)="
+    "-Ios/hal/src"
   ]
 }
 EOF
-          else
-            echo "[INFO] tools/ast_ci/ast_paths.json 가 존재하므로 해당 설정을 사용합니다."
-          fi
 
-          # FIX #2) chtypes.h 위치를 자동 탐색해 fallback include에 추가 (중복 방지)
+          # chtypes.h 위치를 자동 탐색해 fallback include에 추가 (중복 방지)
           CTYPES_FILE=$(git ls-files | grep -E '(^|/)chtypes\\.h$' | head -n 1 || true)
           if [ -n "$CTYPES_FILE" ]; then
             CTYPES_DIR=$(dirname "$CTYPES_FILE")
@@ -137,13 +137,13 @@ EOF
 
             echo "[INFO] fallback_includes 업데이트 완료"
           else
-            echo "[WARN] chtypes.h를 git 트리에서 찾지 못함 (그래도 baseline build-cmd로 커버 기대)"
+            echo "[WARN] chtypes.h를 git 트리에서 찾지 못함"
           fi
 
-          # 이하: 파이썬 스크립트 생성(원본 v16 그대로)
+          # Python 스크립트 생성 (FIX: 백슬래시 리터럴 제거 → chr(92) 사용)
           cat > tools/ast_ci/ast_build_and_diff.py <<'PY'
 #!/usr/bin/env python3
-import argparse, os, json, subprocess, pathlib, shutil, sys, glob, hashlib, difflib
+import argparse, os, json, subprocess, shutil, sys, glob, hashlib
 from datetime import datetime
 
 def run(cmd, **kw):
@@ -173,12 +173,10 @@ def collect_sources(globs_):
     return sorted(set(out))
 
 def ensure_compile_db(build_cmd, workdir="."):
-    # bear로 compile_commands.json 생성
     if not build_cmd:
         return None
     if shutil.which("bear") is None:
         raise RuntimeError("bear not found. please install bear.")
-    # 기존 compile_commands.json 정리 후 생성
     if os.path.exists("compile_commands.json"):
         os.remove("compile_commands.json")
     run(["bash", "-lc", f"bear -- {build_cmd}"], cwd=workdir, check=True)
@@ -191,8 +189,6 @@ def parse_compile_db(path):
         return json.load(f)
 
 def incs_from_compile_db(cdb, src_path):
-    # cdb에서 src와 매칭되는 entry 찾아 include/define 옵션만 추출
-    # (단순 구현: 동일 파일명/경로 포함 기준)
     sp = os.path.abspath(src_path)
     best = None
     for e in cdb:
@@ -210,7 +206,6 @@ def incs_from_compile_db(cdb, src_path):
         args = best["arguments"]
     else:
         args = cmd.split()
-    # -I, -D, -isystem 등만 수집
     out = []
     it = iter(args)
     for a in it:
@@ -255,8 +250,6 @@ def main():
 
     head_commit = subprocess.check_output(["git","rev-parse","--short",args.head]).decode().strip()
 
-    # baseline/incremental 모두 build_cmd 있으면 compile DB 생성/활용
-    cdb_path = None
     cdb = None
     if args.build_cmd:
         try:
@@ -276,7 +269,6 @@ def main():
         if not incs:
             incs += fallback_includes
         incs += extra_defines
-        # 중복 제거(순서 유지)
         seen = set()
         dedup = []
         for x in incs:
@@ -286,11 +278,10 @@ def main():
         return dedup
 
     for src in sources:
-        rel = src.replace("\\","/")
+        rel = src.replace(chr(92), "/")
         before_src = os.path.join(outdir, rel + ".before.c")
         after_src  = os.path.join(outdir, rel + ".after.c")
         os.makedirs(os.path.dirname(before_src), exist_ok=True)
-        # baseline이면 before/after 동일 복사
         shutil.copyfile(src, before_src)
         shutil.copyfile(src, after_src)
 
@@ -302,10 +293,10 @@ def main():
 
         files_meta.append({
             "source": rel,
-            "before_ast": before_ast.replace("\\","/"),
-            "after_ast": after_ast.replace("\\","/"),
+            "before_ast": before_ast.replace(chr(92), "/"),
+            "after_ast":  after_ast.replace(chr(92), "/"),
             "before_sha256": sha256_file(before_ast),
-            "after_sha256": sha256_file(after_ast),
+            "after_sha256":  sha256_file(after_ast),
         })
 
     write_summary(outdir, args.base, args.head, args.mode, files_meta, head_commit)
@@ -329,7 +320,7 @@ def main():
     ast_files = glob.glob(os.path.join(args.dir, "**", "*.ast.json"), recursive=True)
     merged = {"files": []}
     for f in sorted(ast_files):
-      merged["files"].append(f.replace("\\","/"))
+      merged["files"].append(f.replace(chr(92), "/"))
 
     with open(os.path.join(args.dir, "merged_ast_index.json"), "w") as out:
       json.dump(merged, out, indent=2)
@@ -374,7 +365,6 @@ PY
             }
             trap rollback ERR
 
-            # (원본 로직 유지) baseline vs incremental 판단: baseline summary 없으면 baseline으로
             AST_MODE="incremental"
             if [ ! -f "${BASELINE_DIR}/summary.json" ]; then
               AST_MODE="baseline"
