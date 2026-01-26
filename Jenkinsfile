@@ -28,7 +28,7 @@ pipeline {
 
     stage('Prepare workspace') {
       steps {
-        sh """
+        sh """#!/usr/bin/env bash
           set -euxo pipefail
           mkdir -p ${OUT_DIR}/ast_json
           mkdir -p ${OUT_DIR}/merged
@@ -67,9 +67,6 @@ def file_hash(p: Path) -> str:
     return h.hexdigest()
 
 def clang_ast_dump_json(src: Path, out_json: Path):
-    # -fsyntax-only 로 컴파일 산출물 없이 AST만
-    # 헤더는 TU로 parsing하기 까다로워서, 여기서는 .h도 일단 AST dump는 시도하되
-    # 실사용은 주로 .c TU 기준(함수 body 포함)으로 병합/DFD를 만들게 됨.
     cmd = [
         CLANG,
         "-fsyntax-only",
@@ -145,39 +142,19 @@ def walk(node: Any):
         for x in node:
             yield from walk(x)
 
-def get_loc_key(d: Dict[str, Any]) -> str:
-    loc = d.get("loc") or d.get("range", {}).get("begin")
-    if not loc: return ""
-    # loc may contain file/line/col
-    f = loc.get("file", "")
-    line = loc.get("line", "")
-    col = loc.get("col", "")
-    return f"{f}:{line}:{col}"
-
 def extract_functions(ast: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """
-    반환: { funcName: { 'name', 'params':[...], 'returns':[...], 'calls':[ {callee, args:[...]} ] } }
-    - 함수 정의(FunctionDecl with 'inner' including CompoundStmt)가 주 대상
-    """
     funcs: Dict[str, Dict[str, Any]] = {}
-
     for n in walk(ast):
-        if not isinstance(n, dict): 
+        if not isinstance(n, dict):
             continue
         if n.get("kind") != "FunctionDecl":
             continue
-
         name = n.get("name")
         if not name:
             continue
-
         inner = n.get("inner", [])
         has_body = any(isinstance(x, dict) and x.get("kind") in ("CompoundStmt", "CXXTryStmt") for x in inner)
-        if not has_body:
-            # 선언만 있는 경우(특히 헤더)도 params 추출은 가능하지만, return/call은 제한됨
-            pass
 
-        # params
         params = []
         for x in inner:
             if isinstance(x, dict) and x.get("kind") == "ParmVarDecl":
@@ -187,27 +164,21 @@ def extract_functions(ast: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
         funcs.setdefault(name, {"name": name, "params": params, "returns": [], "calls": [], "has_body": has_body})
 
-        # calls + returns (only meaningful if body exists)
-        # calls: CallExpr -> referenced function name is often in 'inner' via DeclRefExpr
         for x in walk(n):
-            if not isinstance(x, dict): 
+            if not isinstance(x, dict):
                 continue
             if x.get("kind") == "CallExpr":
                 callee = None
                 args = []
                 inn = x.get("inner", [])
-                # first inner often is callee expr
                 if inn:
-                    # find DeclRefExpr or MemberExpr inside first child
                     for y in walk(inn[0]):
                         if isinstance(y, dict) and y.get("kind") == "DeclRefExpr":
                             callee = y.get("referencedDecl", {}).get("name") or y.get("name")
                             if callee:
                                 break
-                # remaining inners are args (roughly)
                 if len(inn) >= 2:
                     for a in inn[1:]:
-                        # try extract variable/const tokens
                         token = extract_expr_token(a)
                         if token:
                             args.append(token)
@@ -222,21 +193,13 @@ def extract_functions(ast: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 if token:
                     funcs[name]["returns"].append(token)
 
-    # dedup returns
     for f in funcs.values():
         f["returns"] = sorted(set([r for r in f["returns"] if r]))
     return funcs
 
 def extract_expr_token(expr: Any) -> str:
-    """
-    반환값/인자 표현을 매우 보수적으로 단순화:
-    - DeclRefExpr: 변수명
-    - IntegerLiteral/FloatingLiteral/StringLiteral: 리터럴 값(가능하면 value)
-    - UnaryOperator/BinaryOperator 등: 내부에서 첫 토큰만 잡거나, repr 대체
-    """
     if not isinstance(expr, (dict, list)):
         return ""
-    # walk shallowly
     for n in walk(expr):
         if not isinstance(n, dict):
             continue
@@ -248,13 +211,11 @@ def extract_expr_token(expr: Any) -> str:
             v = n.get("value")
             if v is not None: return str(v)
         if k == "StringLiteral":
-            # avoid huge strings
             v = n.get("value")
             if v is not None:
                 s = str(v)
                 if len(s) > 32: s = s[:32] + "…"
                 return f"\\\"{s}\\\""
-    # fallback: nothing found
     return ""
 
 def build_call_graph(all_funcs: Dict[str, Dict[str, Any]]) -> List[Tuple[str,str,List[str]]]:
@@ -268,14 +229,7 @@ def build_call_graph(all_funcs: Dict[str, Dict[str, Any]]) -> List[Tuple[str,str
     return edges
 
 def merge_ast_by_inlining(funcs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    '병합된 AST'를 실제 AST 노드 트리로 재구성하는 대신,
-    Neo4j에서 시각화하기 쉬운 '함수-호출 트리(inlined)' 형태 JSON으로 산출.
-    - 규칙: caller->callee 관계에서 callee가 funcs에 존재할 때만 inline, 아니면 skip
-    - 순환 호출은 depth 제한으로 방지
-    """
     MAX_DEPTH = 6
-
     def inline(fn: str, depth: int, path: Set[str]) -> Dict[str, Any]:
         base = funcs.get(fn, {"name": fn, "params": [], "returns": [], "calls": [], "has_body": False})
         node = {
@@ -311,12 +265,8 @@ def merge_ast_by_inlining(funcs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     return merged
 
 def write_csv(nodes: List[Dict[str, Any]], rels: List[Dict[str, Any]], nodes_path: Path, rels_path: Path):
-    # Neo4j-admin import 친화적으로 header 포함
-    # node: :ID(Function),name,params,has_body
-    # rel: :START_ID(Function),:END_ID(Function),:TYPE,label
     import csv
     nodes_path.parent.mkdir(parents=True, exist_ok=True)
-
     with nodes_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([":ID(Function)", "name", "params", "has_body"])
@@ -335,9 +285,7 @@ def main():
     repo_root = Path(manifest["repo_root"])
     targets = manifest["targets"]
 
-    # 파일별 AST에서 함수 정보 수집
     all_funcs: Dict[str, Dict[str, Any]] = {}
-
     for t in targets:
         ast_path = repo_root / t["ast_json"]
         try:
@@ -345,23 +293,16 @@ def main():
         except Exception:
             continue
         funcs = extract_functions(ast)
-
-        # 동일 이름 함수가 여러 TU에 나올 수 있음.
-        # 여기서는 "body가 있는 쪽"을 우선(보수적으로) 채택
         for name, info in funcs.items():
             if name not in all_funcs:
                 all_funcs[name] = info
             else:
-                # prefer has_body True
                 if (not all_funcs[name].get("has_body")) and info.get("has_body"):
                     all_funcs[name] = info
 
-    # 2) AST 병합 (inlined JSON)
     merged = merge_ast_by_inlining(all_funcs)
     (out/"merged"/"merged_ast.json").write_text(json.dumps(merged, indent=2), encoding="utf-8")
 
-    # 3) Neo4j import 형태(함수 노드/호출 엣지)
-    # Node IDs
     fn_id = {name: f"F_{i}" for i, name in enumerate(sorted(all_funcs.keys()), start=1)}
 
     nodes = []
@@ -374,9 +315,6 @@ def main():
             "has_body": info.get("has_body", False)
         })
 
-    # 4) DFD 생성 규칙 반영
-    # - caller -> callee : callee의 파라미터명들(파라미터 명만)
-    # - callee -> caller : 반환값(상수/변수명) / 없으면 "function return(void)"
     rels = []
     call_edges = build_call_graph(all_funcs)
 
@@ -395,21 +333,11 @@ def main():
             label_back = "function return(void)"
         rels.append({"start": fn_id[callee], "end": fn_id[caller], "type": "RETURNS", "label": label_back})
 
-    write_csv(
-        nodes,
-        rels,
-        out/"neo4j"/"functions.nodes.csv",
-        out/"neo4j"/"functions.rels.csv"
-    )
+    write_csv(nodes, rels, out/"neo4j"/"functions.nodes.csv", out/"neo4j"/"functions.rels.csv")
 
-    # 5) DFD JSON도 별도 산출(원하면 시각화 툴로도 가능)
-    dfd = {
-        "nodes": [{"id": fn_id[n["name"]], "name": n["name"]} for n in nodes],
-        "edges": rels
-    }
+    dfd = {"nodes": [{"id": fn_id[n["name"]], "name": n["name"]} for n in nodes], "edges": rels}
     (out/"dfd"/"dfd.json").write_text(json.dumps(dfd, indent=2), encoding="utf-8")
 
-    # summary
     summary = {
         "function_count": len(nodes),
         "call_edge_count": sum(1 for r in rels if r["type"] == "CALLS"),
@@ -422,7 +350,8 @@ def main():
 if __name__ == "__main__":
     main()
 '''
-        sh """
+        sh """#!/usr/bin/env bash
+          set -euxo pipefail
           chmod +x ${OUT_DIR}/extract_ast.py
           chmod +x ${OUT_DIR}/build_graphs.py
         """
@@ -431,7 +360,7 @@ if __name__ == "__main__":
 
     stage('Generate AST (per file)') {
       steps {
-        sh """
+        sh """#!/usr/bin/env bash
           set -euxo pipefail
           ${PY} ${OUT_DIR}/extract_ast.py
         """
@@ -440,7 +369,7 @@ if __name__ == "__main__":
 
     stage('Merge AST + Build Neo4j/DFD artifacts') {
       steps {
-        sh """
+        sh """#!/usr/bin/env bash
           set -euxo pipefail
           ${PY} ${OUT_DIR}/build_graphs.py
         """
