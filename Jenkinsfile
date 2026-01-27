@@ -31,6 +31,7 @@ pipeline {
         sh """#!/usr/bin/env bash
           set -euxo pipefail
           mkdir -p ${OUT_DIR}/ast_json
+          mkdir -p ${OUT_DIR}/tu_wrappers
           mkdir -p ${OUT_DIR}/merged
           mkdir -p ${OUT_DIR}/neo4j
           mkdir -p ${OUT_DIR}/dfd
@@ -53,6 +54,15 @@ OUT_DIR = os.environ.get("OUT_DIR", "ast_out")
 TARGET_DIRS = [SRC_DIR, INC_DIR]
 EXTS = {".c", ".h"}
 
+# ChibiOS는 설정 헤더/템플릿 경로가 필요한 경우가 많아 include 경로를 보강
+EXTRA_INCLUDES = [
+    "os/rt/include",
+    "os/rt/templates",
+    "os/hal/include",
+    "os/hal/templates",
+    "os/common/osal/include",
+]
+
 def run(cmd):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return p.returncode, p.stdout, p.stderr
@@ -66,15 +76,33 @@ def file_hash(p: Path) -> str:
             h.update(b)
     return h.hexdigest()
 
-def clang_ast_dump_json(src: Path, out_json: Path):
-    cmd = [
-        CLANG,
+def common_clang_args(repo_root: Path):
+    args = [
         "-fsyntax-only",
         "-Xclang", "-ast-dump=json",
-        "-I", str(Path(INC_DIR).resolve()),
-        "-I", str(Path(SRC_DIR).resolve()),
-        str(src),
+        "-ferror-limit=0",
     ]
+    # include path 보강
+    for inc in EXTRA_INCLUDES:
+        ip = (repo_root / inc).resolve()
+        if ip.exists():
+            args += ["-I", str(ip)]
+    # 기존 v1 include 유지
+    args += ["-I", str((repo_root / INC_DIR).resolve())]
+    args += ["-I", str((repo_root / SRC_DIR).resolve())]
+    return args
+
+def make_header_wrapper(header_rel: Path, wrapper_path: Path):
+    # 헤더(.h)는 단독으로 파싱하면 thread_t/msg_t 같은 타입 미정의로 깨지기 쉬움
+    # 그래서 임시 .c(TU)를 만들어, ch.h를 먼저 include한 상태에서 해당 헤더를 include하도록 한다.
+    code = f"""/* auto-generated wrapper TU for header parsing */
+#include "ch.h"
+#include "{header_rel.as_posix()}"
+"""
+    wrapper_path.write_text(code, encoding="utf-8")
+
+def clang_ast_dump_json(parse_input: Path, out_json: Path, repo_root: Path):
+    cmd = [CLANG] + common_clang_args(repo_root) + [str(parse_input)]
     rc, out, err = run(cmd)
     if rc != 0:
         return False, err.strip()
@@ -84,7 +112,9 @@ def clang_ast_dump_json(src: Path, out_json: Path):
 def main():
     repo_root = Path(".").resolve()
     out_root = Path(OUT_DIR).resolve() / "ast_json"
+    wrap_root = Path(OUT_DIR).resolve() / "tu_wrappers"
     out_root.mkdir(parents=True, exist_ok=True)
+    wrap_root.mkdir(parents=True, exist_ok=True)
 
     targets = []
     for d in TARGET_DIRS:
@@ -105,8 +135,27 @@ def main():
         rel = p.relative_to(repo_root)
         h = file_hash(p)
         out_json = out_root / (str(rel).replace("/", "__") + f".{h}.ast.json")
-        ok, msg = clang_ast_dump_json(p, out_json)
-        item = {"path": str(rel), "hash": h, "ast_json": str(out_json.relative_to(repo_root))}
+
+        # 핵심 수정: .h 는 wrapper TU(.c)를 만들어 그걸 clang 입력으로 사용
+        if p.suffix == ".h":
+            wrapper = wrap_root / (str(rel).replace("/", "__") + f".{h}.tu.c")
+            make_header_wrapper(rel, wrapper)
+            parse_input = wrapper
+            kind = "header_wrapper"
+        else:
+            parse_input = p
+            kind = "source"
+
+        ok, msg = clang_ast_dump_json(parse_input, out_json, repo_root)
+
+        item = {
+            "path": str(rel),
+            "hash": h,
+            "kind": kind,
+            "parse_input": str(parse_input.relative_to(repo_root)) if parse_input.is_relative_to(repo_root) else str(parse_input),
+            "ast_json": str(out_json.relative_to(repo_root))
+        }
+
         if ok:
             manifest["targets"].append(item)
         else:
